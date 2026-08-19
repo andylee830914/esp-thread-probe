@@ -1,0 +1,12 @@
+/build/
+/managed_components/
+/firmware/uplink-wroom32/build/
+/firmware/uplink-wroom32/managed_components/
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.local
+dependencies.lock
+*.bin
+*.elf
+*.map
+.DS_Store

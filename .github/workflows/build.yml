@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  esp32c6-probe:
+    runs-on: ubuntu-latest
+    container: espressif/idf:release-v6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check repository layout
+        shell: bash
+        run: ./tools/check_project.sh
+      - name: Build ESP32-C6 probe
+        shell: bash
+        run: |
+          . /opt/esp/idf/export.sh
+          ./scripts/build.sh
+
+  esp32-uplink:
+    runs-on: ubuntu-latest
+    container: espressif/idf:release-v6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ESP32 uplink
+        shell: bash
+        working-directory: firmware/uplink-wroom32
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py set-target esp32
+          idf.py build

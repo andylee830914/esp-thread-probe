@@ -1,0 +1,35 @@
+menu "ESP Thread Probe Uplink"
+
+config UPLINK_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+
+config UPLINK_WIFI_PASSWORD
+    string "Wi-Fi Password"
+    default ""
+
+config UPLINK_HTTP_PORT
+    int "HTTP server port"
+    default 80
+
+config UPLINK_UART_NUM
+    int "Probe UART number"
+    default 1
+
+config UPLINK_UART_TX_GPIO
+    int "Probe UART TX GPIO"
+    default 17
+
+config UPLINK_UART_RX_GPIO
+    int "Probe UART RX GPIO"
+    default 16
+
+config UPLINK_UART_BAUD
+    int "Probe UART baud rate"
+    default 115200
+
+config UPLINK_PROBE_TIMEOUT_MS
+    int "Probe UART timeout in ms"
+    default 2500
+
+endmenu

@@ -1,0 +1,19 @@
+--- a/espressif__esp-serial-flasher/CMakeLists.txt
++++ b/espressif__esp-serial-flasher/CMakeLists.txt
+@@ -15,6 +15,9 @@
+     if ("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER "4.0")
+         # esp_timer component was introduced in v4.2
+         set(priv_requires driver)
++        if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER_EQUAL "5.0")
++            list(APPEND priv_requires esp_driver_gpio esp_driver_uart)
++        endif()
+         if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_GREATER "4.1")
+             list(APPEND priv_requires esp_timer)
+         endif()
+@@ -79,4 +82,4 @@
+             SERIAL_FLASHER_BOOT_HOLD_TIME_MS=50
+         )
+     endif()
+-endif()
+\ No newline at end of file
++endif()

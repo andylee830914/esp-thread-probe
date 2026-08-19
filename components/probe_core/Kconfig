@@ -1,0 +1,70 @@
+menu "ESP Thread Probe"
+
+config PROBE_UPLINK_UART_ENABLE
+    bool "Enable UART telemetry uplink"
+    default y
+    help
+        Expose probe telemetry over JSON-lines UART for a companion Wi-Fi MCU.
+
+config PROBE_UPLINK_UART_NUM
+    int "Uplink UART number"
+    default 1
+    depends on PROBE_UPLINK_UART_ENABLE
+
+config PROBE_UPLINK_UART_TX_GPIO
+    int "Uplink UART TX GPIO"
+    default 4
+    depends on PROBE_UPLINK_UART_ENABLE
+
+config PROBE_UPLINK_UART_RX_GPIO
+    int "Uplink UART RX GPIO"
+    default 5
+    depends on PROBE_UPLINK_UART_ENABLE
+
+config PROBE_UPLINK_UART_BAUD
+    int "Uplink UART baud rate"
+    default 115200
+    depends on PROBE_UPLINK_UART_ENABLE
+
+config PROBE_THREAD_API_LOCK_TIMEOUT_MS
+    int "Thread telemetry lock timeout in ms"
+    default 0
+    help
+        Maximum time an HTTP telemetry request waits for the OpenThread API
+        lock before returning a busy state.
+
+choice PROBE_BOARD_LED_TYPE
+    prompt "Board LED type"
+    default PROBE_BOARD_LED_ADDRESSABLE
+
+config PROBE_BOARD_LED_DISABLED
+    bool "Disabled"
+
+config PROBE_BOARD_LED_ADDRESSABLE
+    bool "Addressable RGB LED"
+    help
+        Use this for ESP32-C6 DevKit boards with an onboard WS2812/SK6812 RGB LED.
+
+config PROBE_BOARD_LED_GPIO
+    bool "Plain GPIO LED"
+    help
+        Use this for boards with a simple single-color LED driven by GPIO level.
+
+endchoice
+
+config PROBE_BOARD_LED_GPIO_NUM
+    int "Board LED GPIO"
+    default 8
+
+config PROBE_BOARD_LED_ACTIVE_HIGH
+    bool "Board LED active high"
+    default y
+    depends on PROBE_BOARD_LED_GPIO
+
+config PROBE_BOARD_LED_BRIGHTNESS
+    int "Board RGB LED brightness"
+    range 1 255
+    default 16
+    depends on PROBE_BOARD_LED_ADDRESSABLE
+
+endmenu

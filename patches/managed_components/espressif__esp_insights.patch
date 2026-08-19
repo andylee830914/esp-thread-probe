@@ -1,0 +1,17 @@
+--- a/espressif__esp_insights/CMakeLists.txt
++++ b/espressif__esp_insights/CMakeLists.txt
+@@ -28,6 +28,12 @@
+     target_sources(${COMPONENT_LIB} PRIVATE "src/transport/esp_insights_https.c")
+ endif()
+ 
+-# Added just to automatically trigger re-runs of CMake
+-git_describe(ESP_INSIGHTS_VERSION ${COMPONENT_DIR})
++# Component registry archives do not always include enough git metadata for
++# git_describe() to run. ESP Insights is optional here, so keep configuration
++# deterministic even when the dependency came from an archive.
++if(EXISTS "${COMPONENT_DIR}/.git")
++    git_describe(ESP_INSIGHTS_VERSION ${COMPONENT_DIR})
++else()
++    set(ESP_INSIGHTS_VERSION "archive")
++endif()
+ message("ESP Insights Project commit: " ${ESP_INSIGHTS_VERSION})

@@ -1,0 +1,926 @@
+--- a/espressif__esp_matter/CMakeLists.txt
++++ b/espressif__esp_matter/CMakeLists.txt
+@@ -130,6 +130,11 @@
+     if(CONFIG_ESP_MATTER_ENABLE_DATA_MODEL)
+         include("${ESP_COMPONENTS_PATH}/esp_matter/utils/cluster_select/cluster_dir.cmake")
+         get_supported_cluster_dirs(SUPPORTED_CLUSTER_DIRS)
++        if(${IDF_VERSION_MAJOR} GREATER_EQUAL 6)
++            list(REMOVE_ITEM SUPPORTED_CLUSTER_DIRS
++                             "${MATTER_SDK_PATH}/src/app/clusters/closure-control-server"
++                             "${MATTER_SDK_PATH}/src/app/clusters/closure-dimension-server")
++        endif()
+         foreach(CLUSTER_DIR ${SUPPORTED_CLUSTER_DIRS})
+             # If the cluster directory has .c/.cpp file, add it to SRC_DIRS_LIST
+             file(GLOB_RECURSE C_CPP_FILES "${CLUSTER_DIR}/*.c" "${CLUSTER_DIR}/*.cpp")
+@@ -405,9 +410,7 @@
+ 
+     if((NOT CONFIG_ENABLE_WIFI_STATION) AND (NOT CONFIG_ENABLE_WIFI_AP))
+         list(APPEND EXCLUDE_SRCS_LIST "${MATTER_SDK_PATH}/src/platform/ESP32/ConnectivityManagerImpl_WiFi.cpp"
+-                                      "${MATTER_SDK_PATH}/src/platform/ESP32/NetworkCommissioningDriver.cpp"
+-                                      "${MATTER_SDK_PATH}/src/platform/ESP32/route_hook/ESP32RouteHook.c"
+-                                      "${MATTER_SDK_PATH}/src/platform/ESP32/route_hook/ESP32RouteTable.c")
++                                      "${MATTER_SDK_PATH}/src/platform/ESP32/NetworkCommissioningDriver.cpp")
+     endif()
+ 
+     if(NOT CONFIG_ENABLE_ROUTE_HOOK)
+@@ -499,6 +502,12 @@
+                        "-DCHIP_ADDRESS_RESOLVE_IMPL_INCLUDE_HEADER=<lib/address_resolve/AddressResolve_DefaultImpl.h>"
+                        "-DCHIP_CONFIG_SOFTWARE_VERSION_NUMBER=${chip_config_software_version_number}")
+ 
++if(${IDF_VERSION_MAJOR} GREATER_EQUAL 6)
++    target_compile_options(${COMPONENT_LIB} PUBLIC
++                           "-DCHIP_CONFIG_SHA256_CONTEXT_SIZE=256"
++                           "-DCHIP_CONFIG_SHA256_CONTEXT_ALIGN=uint64_t")
++endif()
++
+ if(CHIP_PROJECT_CONFIG)
+     target_compile_options(${COMPONENT_LIB} PUBLIC
+                            "-DCHIP_PROJECT_CONFIG_INCLUDE=${CHIP_PROJECT_CONFIG}"
+--- a/espressif__esp_matter/managed_component_include/CryptoBuildConfig.cmake
++++ b/espressif__esp_matter/managed_component_include/CryptoBuildConfig.cmake
+@@ -2,12 +2,21 @@
+ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/crypto/CryptoBuildConfig.h
+ "#pragma once\n
+ #include <sdkconfig.h>\n
++#include <esp_idf_version.h>\n
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+ #define CHIP_CRYPTO_MBEDTLS 1
+ #define CHIP_CRYPTO_PSA 0
++#define CHIP_CRYPTO_KEYSTORE_PSA 0
++#define CHIP_CRYPTO_KEYSTORE_RAW 1
+ #define CHIP_CRYPTO_PSA_SPAKE2P 0
+-#define CHIP_CRYPTO_PSA_AEAD_SINGLE_PART 0
++#else
++#define CHIP_CRYPTO_MBEDTLS 1
++#define CHIP_CRYPTO_PSA 0
+ #define CHIP_CRYPTO_KEYSTORE_PSA 0
+ #define CHIP_CRYPTO_KEYSTORE_RAW 1
++#define CHIP_CRYPTO_PSA_SPAKE2P 0
++#endif
++#define CHIP_CRYPTO_PSA_AEAD_SINGLE_PART 0
+ #define CHIP_CRYPTO_KEYSTORE_APP 0
+ #define CHIP_CRYPTO_OPENSSL 0
+ #define CHIP_CRYPTO_BORINGSSL 0
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALmbedTLS.h
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALmbedTLS.h
+@@ -39,7 +39,7 @@
+ #define CHIP_CRYPTO_PAL_PRIVATE_X509(x) x
+ #endif
+ 
+-static inline void _log_mbedTLS_error(int errorCode)
++static inline void _log_mbedTLS_error_impl(int errorCode, const char * functionName)
+ {
+ 
+     if (errorCode != 0)
+@@ -48,14 +48,16 @@
+         constexpr size_t kMaxErrorStrLen = 128;
+         char errorStr[kMaxErrorStrLen];
+         mbedtls_strerror(errorCode, errorStr, sizeof(errorStr));
+-        ChipLogError(Crypto, "mbedTLS error: %s", errorStr);
++        ChipLogError(Crypto, "mbedTLS error in %s: %s", functionName, errorStr);
+ #else
+         // Error codes defined in 16-bit negative hex numbers. Ease lookup by printing likewise
+-        ChipLogError(Crypto, "mbedTLS error: -0x%04X", -static_cast<uint16_t>(errorCode));
++        ChipLogError(Crypto, "mbedTLS error in %s: -0x%04X", functionName, -static_cast<uint16_t>(errorCode));
+ #endif
+     }
+ }
+ 
++#define _log_mbedTLS_error(errorCode) _log_mbedTLS_error_impl((errorCode), __func__)
++
+ static inline mbedtls_ecp_group_id MapECPGroupId(SupportedECPKeyTypes keyType)
+ {
+     switch (keyType)
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALmbedTLS.cpp
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALmbedTLS.cpp
+@@ -20,25 +20,49 @@
+  *      mbedTLS based implementation of CHIP crypto primitives
+  */
+ 
++#include <mbedtls/version.h>
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++#define MBEDTLS_ALLOW_PRIVATE_ACCESS
++#endif
++
+ #include "CHIPCryptoPALmbedTLS.h"
+ #include "CHIPCryptoPAL.h"
+ 
++#include <esp_random.h>
++
++#include <algorithm>
+ #include <type_traits>
+ 
+-#include <mbedtls/bignum.h>
++#include <mbedtls/error.h>
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++#include <mbedtls/md.h>
++#include <mbedtls/private/ccm.h>
++#include <mbedtls/private/ctr_drbg.h>
++#include <mbedtls/private/entropy.h>
++#include <mbedtls/private/bignum.h>
++#include <mbedtls/private/ecdsa.h>
++#include <mbedtls/private/ecp.h>
++#include <mbedtls/private/pkcs5.h>
++#include <mbedtls/private/sha1.h>
++#include <mbedtls/private/sha256.h>
++extern "C" {
++#include <mbedtls/private/pk_private.h>
++#include "pk_internal.h"
++}
++#else
+ #include <mbedtls/ccm.h>
+ #include <mbedtls/ctr_drbg.h>
+-#include <mbedtls/ecdh.h>
+-#include <mbedtls/ecdsa.h>
+-#include <mbedtls/ecp.h>
+ #include <mbedtls/entropy.h>
+-#include <mbedtls/error.h>
+ #include <mbedtls/hkdf.h>
+ #include <mbedtls/md.h>
+ #include <mbedtls/pkcs5.h>
+ #include <mbedtls/sha1.h>
+ #include <mbedtls/sha256.h>
+-#include <mbedtls/version.h>
++#include <mbedtls/bignum.h>
++#include <mbedtls/ecdh.h>
++#include <mbedtls/ecdsa.h>
++#include <mbedtls/ecp.h>
++#endif
+ #include <mbedtls/x509_csr.h>
+ 
+ #include <lib/core/CHIPSafeCasts.h>
+@@ -72,7 +96,103 @@
+         return true;
+     }
+     return false;
++}
++
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++static int HMAC_SHA256_mbedtls4(const uint8_t * key, size_t key_length, const uint8_t * message1, size_t message1_length,
++                                const uint8_t * message2, size_t message2_length, const uint8_t * message3,
++                                size_t message3_length, uint8_t * out_buffer)
++{
++    constexpr size_t kBlockLen = 64;
++    uint8_t key_block[kBlockLen] = { 0 };
++    uint8_t ipad[kBlockLen];
++    uint8_t opad[kBlockLen];
++    uint8_t inner[kSHA256_Hash_Length];
++    int result = 0;
++
++    VerifyOrReturnError(key != nullptr, MBEDTLS_ERR_SHA256_BAD_INPUT_DATA);
++    VerifyOrReturnError(out_buffer != nullptr, MBEDTLS_ERR_SHA256_BAD_INPUT_DATA);
++
++    if (key_length > kBlockLen)
++    {
++        mbedtls_sha256_context key_ctx;
++        mbedtls_sha256_init(&key_ctx);
++        result = mbedtls_sha256_starts(&key_ctx, 0);
++        if (result == 0)
++        {
++            result = mbedtls_sha256_update(&key_ctx, Uint8::to_const_uchar(key), key_length);
++        }
++        if (result == 0)
++        {
++            result = mbedtls_sha256_finish(&key_ctx, key_block);
++        }
++        mbedtls_sha256_free(&key_ctx);
++        VerifyOrReturnError(result == 0, result);
++    }
++    else if (key_length > 0)
++    {
++        memcpy(key_block, key, key_length);
++    }
++
++    for (size_t i = 0; i < kBlockLen; i++)
++    {
++        ipad[i] = key_block[i] ^ 0x36;
++        opad[i] = key_block[i] ^ 0x5c;
++    }
++
++    mbedtls_sha256_context ctx;
++    mbedtls_sha256_init(&ctx);
++    result = mbedtls_sha256_starts(&ctx, 0);
++    if (result == 0)
++    {
++        result = mbedtls_sha256_update(&ctx, ipad, sizeof(ipad));
++    }
++    if (result == 0 && message1_length > 0)
++    {
++        VerifyOrExit(message1 != nullptr, result = MBEDTLS_ERR_SHA256_BAD_INPUT_DATA);
++        result = mbedtls_sha256_update(&ctx, Uint8::to_const_uchar(message1), message1_length);
++    }
++    if (result == 0 && message2_length > 0)
++    {
++        VerifyOrExit(message2 != nullptr, result = MBEDTLS_ERR_SHA256_BAD_INPUT_DATA);
++        result = mbedtls_sha256_update(&ctx, Uint8::to_const_uchar(message2), message2_length);
++    }
++    if (result == 0 && message3_length > 0)
++    {
++        VerifyOrExit(message3 != nullptr, result = MBEDTLS_ERR_SHA256_BAD_INPUT_DATA);
++        result = mbedtls_sha256_update(&ctx, Uint8::to_const_uchar(message3), message3_length);
++    }
++    if (result == 0)
++    {
++        result = mbedtls_sha256_finish(&ctx, inner);
++    }
++    mbedtls_sha256_free(&ctx);
++    VerifyOrReturnError(result == 0, result);
++
++    mbedtls_sha256_init(&ctx);
++    result = mbedtls_sha256_starts(&ctx, 0);
++    if (result == 0)
++    {
++        result = mbedtls_sha256_update(&ctx, opad, sizeof(opad));
++    }
++    if (result == 0)
++    {
++        result = mbedtls_sha256_update(&ctx, inner, sizeof(inner));
++    }
++    if (result == 0)
++    {
++        result = mbedtls_sha256_finish(&ctx, out_buffer);
++    }
++    mbedtls_sha256_free(&ctx);
++
++exit:
++    mbedtls_platform_zeroize(key_block, sizeof(key_block));
++    mbedtls_platform_zeroize(ipad, sizeof(ipad));
++    mbedtls_platform_zeroize(opad, sizeof(opad));
++    mbedtls_platform_zeroize(inner, sizeof(inner));
++    return result;
+ }
++#endif
+ 
+ CHIP_ERROR AES_CCM_encrypt(const uint8_t * plaintext, size_t plaintext_length, const uint8_t * aad, size_t aad_length,
+                            const Aes128KeyHandle & key, const uint8_t * nonce, size_t nonce_length, uint8_t * ciphertext,
+@@ -172,7 +292,12 @@
+     // zero data length hash is supported.
+     VerifyOrReturnError(out_buffer != nullptr, CHIP_ERROR_INVALID_ARGUMENT);
+ 
+-#if (MBEDTLS_VERSION_NUMBER >= 0x03000000)
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    const mbedtls_md_info_t * const md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
++    VerifyOrReturnError(md != nullptr, CHIP_ERROR_INTERNAL);
++
++    const int result = mbedtls_md(md, Uint8::to_const_uchar(data), data_length, Uint8::to_uchar(out_buffer));
++#elif (MBEDTLS_VERSION_NUMBER >= 0x03000000)
+     const int result = mbedtls_sha1(Uint8::to_const_uchar(data), data_length, Uint8::to_uchar(out_buffer));
+ #else
+     const int result = mbedtls_sha1_ret(Uint8::to_const_uchar(data), data_length, Uint8::to_uchar(out_buffer));
+@@ -296,8 +421,46 @@
+     const mbedtls_md_info_t * const md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+     VerifyOrReturnError(md != nullptr, CHIP_ERROR_INTERNAL);
+ 
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    constexpr size_t kHashLen = kSHA256_Hash_Length;
++    VerifyOrReturnError(out_length <= 255 * kHashLen, CHIP_ERROR_INVALID_ARGUMENT);
++
++    uint8_t zero_salt[kHashLen] = { 0 };
++    uint8_t prk[kHashLen]       = { 0 };
++    uint8_t previous[kHashLen]  = { 0 };
++    size_t previous_len         = 0;
++    size_t generated_len        = 0;
++    uint8_t counter             = 1;
++
++    const uint8_t * salt_bytes = salt_length > 0 ? salt : zero_salt;
++    size_t salt_bytes_len      = salt_length > 0 ? salt_length : kHashLen;
++
++    int result = HMAC_SHA256_mbedtls4(salt_bytes, salt_bytes_len, secret, secret_length, nullptr, 0, nullptr, 0, prk);
++    VerifyOrReturnError(result == 0, CHIP_ERROR_INTERNAL);
++
++    while (generated_len < out_length)
++    {
++        uint8_t digest[kHashLen] = { 0 };
++        uint8_t counter_buf[1]   = { counter };
++
++        result = HMAC_SHA256_mbedtls4(prk, kHashLen, previous, previous_len, info, info_length, counter_buf,
++                                      sizeof(counter_buf), digest);
++        if (result != 0)
++        {
++            break;
++        }
++
++        const size_t copy_len = std::min(kHashLen, out_length - generated_len);
++        memcpy(out_buffer + generated_len, digest, copy_len);
++        memcpy(previous, digest, kHashLen);
++        previous_len = kHashLen;
++        generated_len += copy_len;
++        counter++;
++    }
++#else
+     const int result = mbedtls_hkdf(md, Uint8::to_const_uchar(salt), salt_length, Uint8::to_const_uchar(secret), secret_length,
+                                     Uint8::to_const_uchar(info), info_length, Uint8::to_uchar(out_buffer), out_length);
++#endif
+     _log_mbedTLS_error(result);
+     VerifyOrReturnError(result == 0, CHIP_ERROR_INTERNAL);
+ 
+@@ -384,6 +547,10 @@
+ 
+ static EntropyContext * get_entropy_context()
+ {
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    gsEntropyContext.mInitialized = true;
++    gsEntropyContext.mDRBGSeeded  = true;
++#else
+     if (!gsEntropyContext.mInitialized)
+     {
+         mbedtls_entropy_init(&gsEntropyContext.mEntropy);
+@@ -391,12 +558,16 @@
+ 
+         gsEntropyContext.mInitialized = true;
+     }
++#endif
+ 
+     return &gsEntropyContext;
+ }
+ 
+ static mbedtls_ctr_drbg_context * get_drbg_context()
+ {
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    return nullptr;
++#else
+     EntropyContext * const context = get_entropy_context();
+ 
+     mbedtls_ctr_drbg_context * const drbgCtxt = &context->mDRBGCtxt;
+@@ -414,12 +585,18 @@
+     }
+ 
+     return drbgCtxt;
++#endif
+ }
+ 
+ CHIP_ERROR add_entropy_source(entropy_source fn_source, void * p_source, size_t threshold)
+ {
+     VerifyOrReturnError(fn_source != nullptr, CHIP_ERROR_INVALID_ARGUMENT);
+ 
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    (void) p_source;
++    (void) threshold;
++    return CHIP_NO_ERROR;
++#else
+     EntropyContext * const entropy_ctxt = get_entropy_context();
+     VerifyOrReturnError(entropy_ctxt != nullptr, CHIP_ERROR_INTERNAL);
+ 
+@@ -427,6 +604,7 @@
+         mbedtls_entropy_add_source(&entropy_ctxt->mEntropy, fn_source, p_source, threshold, MBEDTLS_ENTROPY_SOURCE_STRONG);
+     VerifyOrReturnError(result == 0, CHIP_ERROR_INTERNAL);
+     return CHIP_NO_ERROR;
++#endif
+ }
+ 
+ CHIP_ERROR DRBG_get_bytes(uint8_t * out_buffer, const size_t out_length)
+@@ -434,6 +612,10 @@
+     VerifyOrReturnError(out_buffer != nullptr, CHIP_ERROR_INVALID_ARGUMENT);
+     VerifyOrReturnError(out_length > 0, CHIP_ERROR_INVALID_ARGUMENT);
+ 
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    esp_fill_random(out_buffer, out_length);
++    return CHIP_NO_ERROR;
++#else
+     mbedtls_ctr_drbg_context * const drbg_ctxt = get_drbg_context();
+     VerifyOrReturnError(drbg_ctxt != nullptr, CHIP_ERROR_INTERNAL);
+ 
+@@ -441,11 +623,24 @@
+     VerifyOrReturnError(result == 0, CHIP_ERROR_INTERNAL);
+ 
+     return CHIP_NO_ERROR;
++#endif
+ }
+ 
+-static int CryptoRNG(void * ctxt, uint8_t * out_buffer, size_t out_length)
++static int CryptoRNG(void * ctxt, unsigned char * out_buffer, size_t out_length)
+ {
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    (void) ctxt;
++
++    if ((out_buffer == nullptr) && (out_length > 0))
++    {
++        return 1;
++    }
++
++    esp_fill_random(out_buffer, out_length);
++    return 0;
++#else
+     return (chip::Crypto::DRBG_get_bytes(out_buffer, out_length) == CHIP_NO_ERROR) ? 0 : 1;
++#endif
+ }
+ 
+ static inline mbedtls_ecp_keypair * to_keypair(P256KeypairContext * context)
+@@ -586,7 +781,7 @@
+ 
+ CHIP_ERROR P256Keypair::ECDH_derive_secret(const P256PublicKey & remote_public_key, P256ECDHDerivedSecret & out_secret) const
+ {
+-#if defined(MBEDTLS_ECDH_C)
++#if defined(MBEDTLS_ECDH_C) || MBEDTLS_VERSION_NUMBER >= 0x04000000
+ 
+     CHIP_ERROR error     = CHIP_NO_ERROR;
+     int result           = 0;
+@@ -601,7 +796,12 @@
+     mbedtls_ecp_point ecp_pubkey;
+     mbedtls_ecp_point_init(&ecp_pubkey);
+ 
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    mbedtls_ecp_point ecp_shared;
++    mbedtls_ecp_point_init(&ecp_shared);
++#else
+     const mbedtls_ecp_keypair * keypair = to_const_keypair(&mKeypair);
++#endif
+ 
+     VerifyOrExit(mInitialized, error = CHIP_ERROR_UNINITIALIZED);
+ 
+@@ -612,16 +812,28 @@
+         mbedtls_ecp_point_read_binary(&ecp_grp, &ecp_pubkey, Uint8::to_const_uchar(remote_public_key), remote_public_key.Length());
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INVALID_ARGUMENT);
+ 
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    result = mbedtls_ecp_mul(&ecp_grp, &ecp_shared, &to_const_keypair(&mKeypair)->CHIP_CRYPTO_PAL_PRIVATE(d), &ecp_pubkey, CryptoRNG,
++                             nullptr);
++    VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++
++    result = mbedtls_mpi_write_binary(&ecp_shared.CHIP_CRYPTO_PAL_PRIVATE(X), out_secret.Bytes(), secret_length);
++#else
+     result =
+         mbedtls_ecdh_compute_shared(&ecp_grp, &mpi_secret, &ecp_pubkey, &keypair->CHIP_CRYPTO_PAL_PRIVATE(d), CryptoRNG, nullptr);
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
+ 
+     result = mbedtls_mpi_write_binary(&mpi_secret, out_secret.Bytes(), secret_length);
++#endif
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
+     SuccessOrExit(error = out_secret.SetLength(secret_length));
+ 
+ exit:
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    mbedtls_ecp_point_free(&ecp_shared);
++#else
+     keypair = nullptr;
++#endif
+     mbedtls_ecp_group_free(&ecp_grp);
+     mbedtls_mpi_free(&mpi_secret);
+     mbedtls_ecp_point_free(&ecp_pubkey);
+@@ -793,9 +1005,30 @@
+     mbedtls_x509write_csr_init(&csr);
+ 
+     mbedtls_pk_context pk;
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    uint8_t raw_private_key[kP256_PrivateKey_Length];
++
++    mbedtls_pk_init(&pk);
++    result = mbedtls_pk_setup(&pk, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
++    VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++
++    result = mbedtls_pk_ecc_set_group(&pk, MBEDTLS_ECP_DP_SECP256R1);
++    VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++
++    result = mbedtls_mpi_write_binary(&to_const_keypair(&mKeypair)->CHIP_CRYPTO_PAL_PRIVATE(d), raw_private_key,
++                                      sizeof(raw_private_key));
++    VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++
++    result = mbedtls_pk_ecc_set_key(&pk, raw_private_key, sizeof(raw_private_key));
++    VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++
++    result = mbedtls_pk_set_pubkey_from_prv(&pk);
++    VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++#else
+     pk.CHIP_CRYPTO_PAL_PRIVATE(pk_info) = mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY);
+     pk.CHIP_CRYPTO_PAL_PRIVATE(pk_ctx)  = to_keypair(&mKeypair);
+     VerifyOrExit(pk.CHIP_CRYPTO_PAL_PRIVATE(pk_info) != nullptr, error = CHIP_ERROR_INTERNAL);
++#endif
+ 
+     VerifyOrExit(mInitialized, error = CHIP_ERROR_UNINITIALIZED);
+ 
+@@ -809,7 +1042,11 @@
+     result = mbedtls_x509write_csr_set_subject_name(&csr, "O=CSR");
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
+ 
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    result = mbedtls_x509write_csr_der(&csr, out_csr, csr_length);
++#else
+     result = mbedtls_x509write_csr_der(&csr, out_csr, csr_length, CryptoRNG, nullptr);
++#endif
+     VerifyOrExit(result > 0, error = CHIP_ERROR_INTERNAL);
+     VerifyOrExit(CanCastTo<size_t>(result), error = CHIP_ERROR_INTERNAL);
+ 
+@@ -829,6 +1066,10 @@
+ 
+ exit:
+     mbedtls_x509write_csr_free(&csr);
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    mbedtls_platform_zeroize(raw_private_key, sizeof(raw_private_key));
++    mbedtls_pk_free(&pk);
++#endif
+ 
+     _log_mbedTLS_error(result);
+     return error;
+@@ -994,8 +1235,19 @@
+ 
+     Spake2p_Context * context = to_inner_spake2p_context(&mSpake2pContext);
+ 
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++    uint8_t random_bytes[kP256_FE_Length];
++    do
++    {
++        esp_fill_random(random_bytes, sizeof(random_bytes));
++        result = mbedtls_mpi_read_binary((mbedtls_mpi *) fe, random_bytes, sizeof(random_bytes));
++        VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++    } while (mbedtls_mpi_cmp_int((mbedtls_mpi *) fe, 0) <= 0 ||
++             mbedtls_mpi_cmp_mpi((mbedtls_mpi *) fe, (const mbedtls_mpi *) order) >= 0);
++#else
+     result = mbedtls_ecp_gen_privkey(&context->curve, (mbedtls_mpi *) fe, CryptoRNG, nullptr);
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
++#endif
+ 
+ exit:
+     _log_mbedTLS_error(result);
+@@ -1051,9 +1303,12 @@
+ {
+     Spake2p_Context * context = to_inner_spake2p_context(&mSpake2pContext);
+ 
+-    if (mbedtls_ecp_mul(&context->curve, (mbedtls_ecp_point *) R, (const mbedtls_mpi *) fe1, (const mbedtls_ecp_point *) P1,
+-                        CryptoRNG, nullptr) != 0)
++    int result = mbedtls_ecp_mul(&context->curve, (mbedtls_ecp_point *) R, (const mbedtls_mpi *) fe1,
++                                 (const mbedtls_ecp_point *) P1, CryptoRNG, nullptr);
++    if (result != 0)
+     {
++        ChipLogError(Crypto, "SPAKE2+ PointMul failed: %d", result);
++        _log_mbedTLS_error(result);
+         return CHIP_ERROR_INTERNAL;
+     }
+ 
+@@ -1065,9 +1320,13 @@
+ {
+     Spake2p_Context * context = to_inner_spake2p_context(&mSpake2pContext);
+ 
+-    if (mbedtls_ecp_muladd(&context->curve, (mbedtls_ecp_point *) R, (const mbedtls_mpi *) fe1, (const mbedtls_ecp_point *) P1,
+-                           (const mbedtls_mpi *) fe2, (const mbedtls_ecp_point *) P2) != 0)
++    int result = mbedtls_ecp_muladd(&context->curve, (mbedtls_ecp_point *) R, (const mbedtls_mpi *) fe1,
++                                    (const mbedtls_ecp_point *) P1, (const mbedtls_mpi *) fe2,
++                                    (const mbedtls_ecp_point *) P2);
++    if (result != 0)
+     {
++        ChipLogError(Crypto, "SPAKE2+ PointAddMul failed: %d", result);
++        _log_mbedTLS_error(result);
+         return CHIP_ERROR_INTERNAL;
+     }
+ 
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALmbedTLSCert.cpp
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALmbedTLSCert.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include <mbedtls/ecp.h>
+ #include <mbedtls/oid.h>
++#include <mbedtls/version.h>
+ #include <mbedtls/x509.h>
+ #include <mbedtls/x509_csr.h>
+ 
+@@ -51,8 +52,6 @@
+     CHIP_ERROR error   = CHIP_NO_ERROR;
+     size_t pubkey_size = 0;
+ 
+-    mbedtls_ecp_keypair * keypair = nullptr;
+-
+     P256ECDSASignature signature;
+     MutableByteSpan out_raw_sig_span(signature.Bytes(), signature.Capacity());
+ 
+@@ -64,9 +63,20 @@
+ 
+     // Verify the signature algorithm and public key type
+     VerifyOrExit(csr.CHIP_CRYPTO_PAL_PRIVATE(sig_md) == MBEDTLS_MD_SHA256, error = CHIP_ERROR_UNSUPPORTED_SIGNATURE_TYPE);
++#if (MBEDTLS_VERSION_NUMBER >= 0x04000000)
++    VerifyOrExit(csr.CHIP_CRYPTO_PAL_PRIVATE(sig_pk) == MBEDTLS_PK_SIGALG_ECDSA, error = CHIP_ERROR_WRONG_KEY_TYPE);
++    VerifyOrExit(PSA_KEY_TYPE_IS_ECC_PUBLIC_KEY(csr.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(psa_type)),
++                 error = CHIP_ERROR_WRONG_KEY_TYPE);
++    VerifyOrExit(PSA_KEY_TYPE_ECC_GET_FAMILY(csr.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(psa_type)) ==
++                     PSA_ECC_FAMILY_SECP_R1,
++                 error = CHIP_ERROR_WRONG_KEY_TYPE);
++    VerifyOrExit(csr.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(pub_raw_len) == pubkey.Length(),
++                 error = CHIP_ERROR_INTERNAL);
++    memcpy(pubkey.Bytes(), csr.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(pub_raw), pubkey.Length());
++#else
+     VerifyOrExit(csr.CHIP_CRYPTO_PAL_PRIVATE(sig_pk) == MBEDTLS_PK_ECDSA, error = CHIP_ERROR_WRONG_KEY_TYPE);
+ 
+-    keypair = mbedtls_pk_ec(csr.CHIP_CRYPTO_PAL_PRIVATE_X509(pk));
++    mbedtls_ecp_keypair * keypair = mbedtls_pk_ec(csr.CHIP_CRYPTO_PAL_PRIVATE_X509(pk));
+ 
+     // Copy the public key from the CSR
+     result = mbedtls_ecp_point_write_binary(&keypair->CHIP_CRYPTO_PAL_PRIVATE(grp), &keypair->CHIP_CRYPTO_PAL_PRIVATE(Q),
+@@ -74,6 +84,7 @@
+ 
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
+     VerifyOrExit(pubkey_size == pubkey.Length(), error = CHIP_ERROR_INTERNAL);
++#endif
+ 
+     // Convert DER signature to raw signature
+     error = EcdsaAsn1SignatureToRaw(kP256_FE_Length,
+@@ -507,7 +518,6 @@
+ #if defined(MBEDTLS_X509_CRT_PARSE_C)
+     CHIP_ERROR error = CHIP_NO_ERROR;
+     mbedtls_x509_crt mbed_cert;
+-    mbedtls_ecp_keypair * keypair = nullptr;
+     size_t pubkey_size            = 0;
+ 
+     mbedtls_x509_crt_init(&mbed_cert);
+@@ -515,10 +525,20 @@
+     int result = mbedtls_x509_crt_parse(&mbed_cert, Uint8::to_const_uchar(certificate.data()), certificate.size());
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
+ 
++#if (MBEDTLS_VERSION_NUMBER >= 0x04000000)
++    VerifyOrExit(PSA_KEY_TYPE_IS_ECC_PUBLIC_KEY(mbed_cert.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(psa_type)),
++                 error = CHIP_ERROR_INVALID_ARGUMENT);
++    VerifyOrExit(PSA_KEY_TYPE_ECC_GET_FAMILY(mbed_cert.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(psa_type)) ==
++                     PSA_ECC_FAMILY_SECP_R1,
++                 error = CHIP_ERROR_INVALID_ARGUMENT);
++    VerifyOrExit(mbed_cert.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(pub_raw_len) == pubkey.Length(),
++                 error = CHIP_ERROR_INTERNAL);
++    memcpy(pubkey.Bytes(), mbed_cert.CHIP_CRYPTO_PAL_PRIVATE_X509(pk).CHIP_CRYPTO_PAL_PRIVATE(pub_raw), pubkey.Length());
++#else
+     VerifyOrExit(mbedtls_pk_get_type(&(mbed_cert.CHIP_CRYPTO_PAL_PRIVATE_X509(pk))) == MBEDTLS_PK_ECKEY,
+                  error = CHIP_ERROR_INVALID_ARGUMENT);
+ 
+-    keypair = mbedtls_pk_ec(mbed_cert.CHIP_CRYPTO_PAL_PRIVATE_X509(pk));
++    mbedtls_ecp_keypair * keypair = mbedtls_pk_ec(mbed_cert.CHIP_CRYPTO_PAL_PRIVATE_X509(pk));
+     VerifyOrExit(keypair->CHIP_CRYPTO_PAL_PRIVATE(grp).id == MapECPGroupId(pubkey.Type()), error = CHIP_ERROR_INVALID_ARGUMENT);
+     // Copy the public key from the cert in raw point format
+     result =
+@@ -527,6 +547,7 @@
+ 
+     VerifyOrExit(result == 0, error = CHIP_ERROR_INTERNAL);
+     VerifyOrExit(pubkey_size == pubkey.Length(), error = CHIP_ERROR_INTERNAL);
++#endif
+ 
+ exit:
+     _log_mbedTLS_error(result);
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALPSA.cpp
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/crypto/CHIPCryptoPALPSA.cpp
+@@ -35,8 +35,14 @@
+ 
+ #include <psa/crypto.h>
+ 
++#include <mbedtls/version.h>
++#if MBEDTLS_VERSION_NUMBER >= 0x04000000
++#include <mbedtls/private/bignum.h>
++#include <mbedtls/private/ecp.h>
++#else
+ #include <mbedtls/bignum.h>
+ #include <mbedtls/ecp.h>
++#endif
+ #include <mbedtls/error.h>
+ #include <mbedtls/x509_csr.h>
+ 
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/inet/UDPEndPointImplLwIP.cpp
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/inet/UDPEndPointImplLwIP.cpp
+@@ -34,6 +34,16 @@
+ #include <lwip/raw.h>
+ #include <lwip/udp.h>
+ 
++#if defined(ESP_PLATFORM) && __has_include("esp_openthread_netif_glue.h")
++extern "C" {
++#include "esp_netif.h"
++#include "esp_openthread_netif_glue.h"
++}
++#define CHIP_LWIP_HAS_ESP_OPENTHREAD_NETIF 1
++#else
++#define CHIP_LWIP_HAS_ESP_OPENTHREAD_NETIF 0
++#endif
++
+ static_assert(LWIP_VERSION_MAJOR > 1, "CHIP requires LwIP 2.0 or later");
+ 
+ #if !defined(RAW_FLAGS_MULTICAST_LOOP) || !defined(UDP_FLAGS_MULTICAST_LOOP) || !defined(raw_clear_flags) ||                       \
+@@ -59,6 +69,76 @@
+ 
+ EndpointQueueFilter * UDPEndPointImplLwIP::sQueueFilter = nullptr;
+ 
++namespace {
++#if CHIP_LWIP_HAS_ESP_OPENTHREAD_NETIF
++struct netif * FindEspOpenThreadNetif()
++{
++    esp_netif_t * otNetif = esp_openthread_get_netif();
++    if (otNetif == nullptr)
++    {
++        return nullptr;
++    }
++
++    const int netifIndex = esp_netif_get_netif_impl_index(otNetif);
++    if (netifIndex <= 0)
++    {
++        return nullptr;
++    }
++
++    return netif_get_by_index(static_cast<u8_t>(netifIndex));
++}
++#endif // CHIP_LWIP_HAS_ESP_OPENTHREAD_NETIF
++
++struct netif * FindNetifForUniqueLocalDestination(const ip_addr_t & destAddr)
++{
++    if (IP_GET_TYPE(&destAddr) != IPADDR_TYPE_V6)
++    {
++        return nullptr;
++    }
++
++    const ip6_addr_t * dest = ip_2_ip6(&destAddr);
++    if (!ip6_addr_isuniquelocal(dest))
++    {
++        return nullptr;
++    }
++
++    struct netif * candidate       = nullptr;
++    struct netif * threadCandidate = nullptr;
++    NETIF_FOREACH(candidate)
++    {
++        if (!netif_is_up(candidate) || !netif_is_link_up(candidate))
++        {
++            continue;
++        }
++
++        if (candidate->name[0] == 't' && candidate->name[1] == 'h')
++        {
++            threadCandidate = candidate;
++        }
++
++        for (u8_t i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++)
++        {
++            const ip6_addr_t * localAddr = netif_ip6_addr(candidate, i);
++            if (ip6_addr_isvalid(netif_ip6_addr_state(candidate, i)) && ip6_addr_isuniquelocal(localAddr) &&
++                ip6_addr_net_eq(dest, localAddr))
++            {
++                return candidate;
++            }
++        }
++    }
++
++#if CHIP_LWIP_HAS_ESP_OPENTHREAD_NETIF
++    struct netif * espOtNetif = FindEspOpenThreadNetif();
++    if (espOtNetif != nullptr)
++    {
++        return espOtNetif;
++    }
++#endif // CHIP_LWIP_HAS_ESP_OPENTHREAD_NETIF
++
++    return threadCandidate;
++}
++} // namespace
++
+ CHIP_ERROR UDPEndPointImplLwIP::BindImpl(IPAddressType addressType, const IPAddress & address, uint16_t port,
+                                          InterfaceId interfaceId)
+ {
+@@ -173,27 +253,62 @@
+     ip_addr_t lwipSrcAddr  = srcAddr.ToLwIPAddr();
+     ip_addr_t lwipDestAddr = destAddr.ToLwIPAddr();
+ 
++    char srcStr[IPAddress::kMaxStringLength]  = { 0 };
++    char destStr[IPAddress::kMaxStringLength] = { 0 };
++    srcAddr.ToString(srcStr, sizeof(srcStr));
++    destAddr.ToString(destStr, sizeof(destStr));
++
+     ip_addr_t boundAddr;
+     ip_addr_copy(boundAddr, mUDP->local_ip);
+ 
+-    if (!ip_addr_isany(&lwipSrcAddr))
++    const bool allowSourceOverride = !ip_addr_isany(&lwipSrcAddr) && !IP_IS_V6(&lwipSrcAddr);
++
++    ChipLogProgress(Inet, "LwIP UDP send src=%s dst=%s:%u if=%p override=%u len=%u", srcStr, destStr, destPort,
++                    intfId.IsPresent() ? intfId.GetPlatformInterface() : nullptr, allowSourceOverride,
++                    static_cast<unsigned>(msg->DataLength()));
++
++    if (allowSourceOverride)
+     {
+         ip_addr_copy(mUDP->local_ip, lwipSrcAddr);
+     }
+ 
+-    lwipErr = RunOnTCPIPRet([this, &intfId, &msg, &lwipDestAddr, destPort]() {
++    struct netif * selectedIntf = nullptr;
++    lwipErr = RunOnTCPIPRet([this, &intfId, &msg, &lwipDestAddr, destPort, &selectedIntf]() {
+         if (intfId.IsPresent())
+         {
++            selectedIntf = intfId.GetPlatformInterface();
+             return udp_sendto_if(mUDP, System::LwIPPacketBufferView::UnsafeGetLwIPpbuf(msg), &lwipDestAddr, destPort,
+-                                 intfId.GetPlatformInterface());
++                                 selectedIntf);
+         }
++
++        selectedIntf = FindNetifForUniqueLocalDestination(lwipDestAddr);
++        if (selectedIntf != nullptr)
++        {
++            return udp_sendto_if(mUDP, System::LwIPPacketBufferView::UnsafeGetLwIPpbuf(msg), &lwipDestAddr, destPort,
++                                 selectedIntf);
++        }
++
+         return udp_sendto(mUDP, System::LwIPPacketBufferView::UnsafeGetLwIPpbuf(msg), &lwipDestAddr, destPort);
+     });
+ 
+-    ip_addr_copy(mUDP->local_ip, boundAddr);
++    if (selectedIntf != nullptr)
++    {
++        ChipLogProgress(Inet, "LwIP UDP route selected if=%p name=%c%c%d", selectedIntf, selectedIntf->name[0],
++                        selectedIntf->name[1], selectedIntf->num);
++    }
++    else
++    {
++        ChipLogProgress(Inet, "LwIP UDP route selected if=%p", selectedIntf);
++    }
+ 
++    if (allowSourceOverride)
++    {
++        ip_addr_copy(mUDP->local_ip, boundAddr);
++    }
++
+     if (lwipErr != ERR_OK)
+     {
++        ChipLogError(Inet, "LwIP UDP send failed: %d", lwipErr);
+         res = chip::System::MapErrorLwIP(lwipErr);
+     }
+ 
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/inet/UDPEndPointImplOpenThread.cpp
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/inet/UDPEndPointImplOpenThread.cpp
+@@ -233,10 +233,20 @@
+ 
+     memset(&messageInfo, 0, sizeof(messageInfo));
+ 
+-    messageInfo.mSockAddr = aPktInfo->SrcAddress.ToIPv6();
++    if (aPktInfo->SrcAddress != IPAddress::Any)
++    {
++        messageInfo.mSockAddr = aPktInfo->SrcAddress.ToIPv6();
++    }
+     messageInfo.mPeerAddr = aPktInfo->DestAddress.ToIPv6();
+     messageInfo.mPeerPort = aPktInfo->DestPort;
+ 
++    char sourceStr[IPAddress::kMaxStringLength] = { 0 };
++    char destStr[IPAddress::kMaxStringLength]   = { 0 };
++    aPktInfo->SrcAddress.ToString(sourceStr, sizeof(sourceStr));
++    aPktInfo->DestAddress.ToString(destStr, sizeof(destStr));
++    ChipLogProgress(Inet, "OT UDP send src=%s dst=%s:%u len=%u", sourceStr, destStr, aPktInfo->DestPort,
++                    static_cast<unsigned>(msg->DataLength()));
++
+     LockOpenThread();
+     message = otUdpNewMessage(mOTInstance, NULL);
+     VerifyOrExit(message != NULL, error = OT_ERROR_NO_BUFS);
+@@ -251,6 +261,7 @@
+ exit:
+     if (error != OT_ERROR_NONE && message != NULL)
+     {
++        ChipLogError(Inet, "OT UDP send failed: %s", otThreadErrorToString(error));
+         otMessageFree(message);
+     }
+ 
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/platform/ESP32/DiagnosticDataProviderImpl.cpp
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/platform/ESP32/DiagnosticDataProviderImpl.cpp
+@@ -31,6 +31,7 @@
+ 
+ #include "esp_event.h"
+ #include "esp_heap_caps_init.h"
++#include "esp_idf_version.h"
+ #include "esp_log.h"
+ #include "esp_netif.h"
+ #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+@@ -48,6 +49,12 @@
+ using namespace ::chip::DeviceLayer::Internal;
+ using namespace ::chip::app::Clusters::GeneralDiagnostics;
+ 
++#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
++#define CHIP_ESP_NETIF_NEXT(netif) esp_netif_next_unsafe(netif)
++#else
++#define CHIP_ESP_NETIF_NEXT(netif) esp_netif_next(netif)
++#endif
++
+ namespace {
+ 
+ InterfaceTypeEnum GetInterfaceType(const char * if_desc)
+@@ -190,7 +197,7 @@
+ 
+ CHIP_ERROR DiagnosticDataProviderImpl::GetNetworkInterfaces(NetworkInterface ** netifpp)
+ {
+-    esp_netif_t * netif     = esp_netif_next(NULL);
++    esp_netif_t * netif     = CHIP_ESP_NETIF_NEXT(NULL);
+     NetworkInterface * head = NULL;
+     uint8_t ipv6_addr_count = 0;
+     esp_ip6_addr_t ip6_addr[LWIP_IPV6_NUM_ADDRESSES];
+@@ -200,7 +207,7 @@
+     }
+     else
+     {
+-        for (esp_netif_t * ifa = netif; ifa != NULL; ifa = esp_netif_next(ifa))
++        for (esp_netif_t * ifa = netif; ifa != NULL; ifa = CHIP_ESP_NETIF_NEXT(ifa))
+         {
+             NetworkInterface * ifp = new NetworkInterface();
+             uint8_t addressSize    = 0;
+--- a/espressif__esp_matter/connectedhomeip/connectedhomeip/src/platform/ESP32/ConnectivityManagerImpl_WiFi.cpp
++++ b/espressif__esp_matter/connectedhomeip/connectedhomeip/src/platform/ESP32/ConnectivityManagerImpl_WiFi.cpp
+@@ -35,7 +35,19 @@
+ #include "esp_event.h"
+ #include "esp_netif.h"
+ #include "esp_wifi.h"
++
++#ifndef WIFI_REASON_NOT_ASSOCED
++#define WIFI_REASON_NOT_ASSOCED WIFI_REASON_CLASS3_FRAME_FROM_NONASSOC_STA
++#endif
++
++#ifndef WIFI_REASON_NOT_AUTHED
++#define WIFI_REASON_NOT_AUTHED WIFI_REASON_CLASS2_FRAME_FROM_NONAUTH_STA
++#endif
+ 
++#ifndef WIFI_REASON_ASSOC_EXPIRE
++#define WIFI_REASON_ASSOC_EXPIRE WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY
++#endif
++
+ #include <lwip/dns.h>
+ #include <lwip/ip_addr.h>
+ #include <lwip/nd6.h>

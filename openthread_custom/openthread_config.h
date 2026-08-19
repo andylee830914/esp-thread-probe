@@ -1,0 +1,3 @@
+#pragma once
+
+#define OPENTHREAD_CONFIG_TMF_NETDIAG_CLIENT_ENABLE 1
