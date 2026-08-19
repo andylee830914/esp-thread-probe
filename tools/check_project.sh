@@ -4,11 +4,8 @@ set -euo pipefail
 required=(
   CMakeLists.txt
   main/probe_main.c
-  patches/managed_components/README.md
-  scripts/apply_managed_component_patches.py
   components/probe_core/CMakeLists.txt
   components/probe_core/idf_component.yml
-  components/json/CMakeLists.txt
   components/probe_core/src/probe_thread.c
   components/probe_core/src/probe_bridge.c
   components/probe_matter/src/probe_matter.cpp

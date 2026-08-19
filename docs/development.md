@@ -11,10 +11,9 @@ The ESP32-C6 application entry point is the repository root project. Its layout
 keeps ESP-IDF application code at the root while isolating probe logic in
 `components/probe_core` and Matter-specific integration in `components/probe_matter`.
 
-Generated `managed_components/` directories are ignored. Any required local
-changes to downloaded dependencies must be committed as patches under
-`patches/managed_components` and applied with
-`scripts/apply_managed_component_patches.py`.
+Generated `managed_components/` directories are ignored. The project currently
+builds against ESP-Matter 1.6.0 without local changes to downloaded
+dependencies.
 
 The default partition table uses one large app slot on 4MB flash. Matter plus Thread is too large for two OTA slots on 4MB in the current MVP.
 

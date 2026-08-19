@@ -16,16 +16,6 @@ idf_py=("${IDF_PYTHON_ENV_PATH}/bin/python" "${IDF_PATH}/tools/idf.py")
 cd "${project_path}"
 export IDF_TARGET=esp32c6
 
-initial_resolve_failed=0
-if ! "${idf_py[@]}" update-dependencies; then
-  echo "Initial dependency resolve did not complete; applying managed component patches before retry." >&2
-  initial_resolve_failed=1
-fi
-"${script_dir}/apply_managed_component_patches.py" --project "${project_dir}"
-if [[ "${initial_resolve_failed}" -eq 1 ]]; then
-  rm -rf "${project_path}/build"
-fi
 "${idf_py[@]}" set-target esp32c6
 "${idf_py[@]}" update-dependencies
-"${script_dir}/apply_managed_component_patches.py" --project "${project_dir}"
 "${idf_py[@]}" build

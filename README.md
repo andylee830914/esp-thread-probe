@@ -38,10 +38,6 @@ The split is intentional: the ESP32-C6 no longer keeps a Wi-Fi station link aliv
 - Two serial ports, one for each board during flashing and debug
 - Internet access during the first build so ESP-IDF Component Manager can fetch managed dependencies
 
-Managed dependencies are patched locally by `./scripts/build.sh`. Use the helper
-for normal builds; it handles the clean-checkout case where ESP-IDF downloads
-managed components before local patches are applied.
-
 ## Quick Start
 
 Activate ESP-IDF 6.0.2, then build and flash the ESP32-C6 probe:
@@ -158,7 +154,6 @@ The fixed passcode and discriminator are for development only. Production builds
 ```text
 main/
 components/
-  json/
   probe_core/
   probe_matter/
 firmware/
