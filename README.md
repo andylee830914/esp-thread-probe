@@ -114,8 +114,8 @@ requests to the ESP32-C6 over UART and returns the C6 JSON response.
 | `GET /routers` | Thread router table with next hop and path cost |
 | `GET /children` | Children attached to this probe when it is a parent |
 | `GET /topology` | Combined self, leader, routers, neighbors, and local children |
-| `GET /router-neighbors/scan` | Ask each Thread router for its router links using Network Diagnostic |
-| `GET /router-neighbors` | Last cached router-neighbor diagnostic result |
+| `GET /router-neighbors/scan` | Start a Mesh Diagnostics topology and detail scan |
+| `GET /router-neighbors` | Last cached Mesh Diagnostics router-neighbor result |
 | `GET /router` | Current role, RLOC16, router id, parent info |
 | `GET /ipaddr` | Thread IPv6 addresses |
 | `GET /leader` | Leader data |

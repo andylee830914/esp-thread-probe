@@ -140,6 +140,7 @@ static void bridge_task(void *arg)
     (void)arg;
     char line[96];
     size_t pos = 0;
+    bool discard_until_newline = false;
 
     ESP_LOGI(TAG, "uart bridge ready on UART%d tx=%d rx=%d baud=%d",
              CONFIG_PROBE_UPLINK_UART_NUM,
@@ -153,19 +154,35 @@ static void bridge_task(void *arg)
         if (n <= 0) {
             continue;
         }
+
+        if (discard_until_newline) {
+            if (ch == '\n') {
+                discard_until_newline = false;
+                pos = 0;
+            }
+            continue;
+        }
+
         if (ch == '\n') {
             line[pos] = '\0';
             trim_line(line);
             if (line[0]) {
-                ESP_LOGI(TAG, "uart request: %s", line);
-                send_json_line(dispatch_command(line));
+                if (line[0] == '{' || line[0] == '[') {
+                    ESP_LOGW(TAG, "discarding echoed JSON frame");
+                } else {
+                    ESP_LOGI(TAG, "uart request: %s", line);
+                    send_json_line(dispatch_command(line));
+                }
             }
             pos = 0;
+        } else if (pos == 0 && (ch == '{' || ch == '[')) {
+            discard_until_newline = true;
         } else if (pos < sizeof(line) - 1) {
             line[pos++] = (char)ch;
         } else {
             pos = 0;
-            send_json_line(error_json("command too long"));
+            discard_until_newline = true;
+            ESP_LOGW(TAG, "discarding overlong UART command");
         }
     }
 }

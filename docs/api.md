@@ -40,14 +40,19 @@ neighbors, and local children.
 
 ## `GET /router-neighbors/scan`
 
-Starts a Thread Network Diagnostic scan against known Thread routers. The scan
-uses OpenThread TMF Network Diagnostic client support and completes
-asynchronously.
+Starts an OpenThread Mesh Diagnostics topology scan. The scan discovers routers
+with `otMeshDiagDiscoverTopology()`, then asynchronously drains child-table and
+router-neighbor-table detail queries.
 
 ## `GET /router-neighbors`
 
-Returns the last cached router-neighbor diagnostic result, including router
-links and child MAC addresses collected by the background scanner.
+Returns the last cached Mesh Diagnostics result, including router topology
+links as `link_quality`, router-neighbor RSSI/error-rate details, and child
+table details collected by the background scanner. Missing diagnostic values are
+omitted instead of reported as placeholder zeroes. Router table status fields
+distinguish queued, pending, timeout, and successful detail collection. Error
+rates use OpenThread's raw 0..65535 scale, where 65535 represents 100%. Route
+cost is not emitted by this MeshDiag-first response.
 
 ## `GET /router`
 

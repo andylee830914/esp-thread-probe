@@ -41,30 +41,66 @@ using namespace esp_matter::endpoint;
 
 static const char *TAG = "probe_matter";
 static uint16_t s_endpoint_id;
+static bool s_matter_started;
+static bool s_matter_light_on;
 #if CONFIG_PROBE_BOARD_LED_ADDRESSABLE
 static led_strip_handle_t s_led_strip;
 #endif
 
-static esp_err_t board_led_set(bool on)
+typedef enum {
+    BOARD_LED_COLOR_OFF = 0,
+    BOARD_LED_COLOR_WHITE,
+    BOARD_LED_COLOR_BLUE,
+    BOARD_LED_COLOR_GREEN,
+} board_led_color_t;
+
+static esp_err_t board_led_set_color(board_led_color_t color)
 {
 #if CONFIG_PROBE_BOARD_LED_ADDRESSABLE
     if (!s_led_strip) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (on) {
-        ESP_RETURN_ON_ERROR(led_strip_set_pixel(s_led_strip, 0, 0, CONFIG_PROBE_BOARD_LED_BRIGHTNESS, 0),
-                            TAG, "set board RGB LED failed");
-        return led_strip_refresh(s_led_strip);
+    if (color == BOARD_LED_COLOR_OFF) {
+        return led_strip_clear(s_led_strip);
     }
-    return led_strip_clear(s_led_strip);
+
+    uint8_t red = 0;
+    uint8_t green = 0;
+    uint8_t blue = 0;
+    switch (color) {
+    case BOARD_LED_COLOR_WHITE:
+        red = CONFIG_PROBE_BOARD_LED_BRIGHTNESS;
+        green = CONFIG_PROBE_BOARD_LED_BRIGHTNESS;
+        blue = CONFIG_PROBE_BOARD_LED_BRIGHTNESS;
+        break;
+    case BOARD_LED_COLOR_BLUE:
+        blue = CONFIG_PROBE_BOARD_LED_BRIGHTNESS;
+        break;
+    case BOARD_LED_COLOR_GREEN:
+        green = CONFIG_PROBE_BOARD_LED_BRIGHTNESS;
+        break;
+    case BOARD_LED_COLOR_OFF:
+    default:
+        break;
+    }
+
+    ESP_RETURN_ON_ERROR(led_strip_set_pixel(s_led_strip, 0, red, green, blue),
+                        TAG, "set board RGB LED failed");
+    return led_strip_refresh(s_led_strip);
 #elif CONFIG_PROBE_BOARD_LED_GPIO
+    bool on = color != BOARD_LED_COLOR_OFF;
     const int level = on ? CONFIG_PROBE_BOARD_LED_ACTIVE_HIGH : !CONFIG_PROBE_BOARD_LED_ACTIVE_HIGH;
     gpio_set_level((gpio_num_t)CONFIG_PROBE_BOARD_LED_GPIO_NUM, level);
     return ESP_OK;
 #else
-    (void)on;
+    (void)color;
     return ESP_OK;
 #endif
+}
+
+static esp_err_t board_led_show_matter_state(void)
+{
+    return board_led_set_color(s_matter_light_on ? BOARD_LED_COLOR_GREEN : BOARD_LED_COLOR_OFF);
 }
 
 static esp_err_t board_led_init(void)
@@ -89,7 +125,7 @@ static esp_err_t board_led_init(void)
     };
     ESP_RETURN_ON_ERROR(led_strip_new_rmt_device(&strip_config, &rmt_config, &s_led_strip),
                         TAG, "board RGB LED init failed");
-    return board_led_set(false);
+    return board_led_set_color(BOARD_LED_COLOR_WHITE);
 #elif CONFIG_PROBE_BOARD_LED_GPIO
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << CONFIG_PROBE_BOARD_LED_GPIO_NUM,
@@ -99,10 +135,23 @@ static esp_err_t board_led_init(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "board GPIO LED init failed");
-    return board_led_set(false);
+    return board_led_set_color(BOARD_LED_COLOR_WHITE);
 #else
     return ESP_OK;
 #endif
+}
+
+static void thread_attach_led_cb(bool attached, void *context)
+{
+    (void)context;
+    if (s_matter_started) {
+        return;
+    }
+
+    esp_err_t err = board_led_set_color(attached ? BOARD_LED_COLOR_BLUE : BOARD_LED_COLOR_WHITE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Thread attach LED update failed: %s", esp_err_to_name(err));
+    }
 }
 
 static void matter_event_cb(const ChipDeviceEvent *event, intptr_t arg)
@@ -143,9 +192,12 @@ static esp_err_t attribute_update_cb(attribute::callback_type_t type,
 
     if (type == attribute::POST_UPDATE && endpoint_id == s_endpoint_id && cluster_id == 0x00000006 &&
         attribute_id == 0x00000000 && val && val->type == ESP_MATTER_VAL_TYPE_BOOLEAN) {
-        esp_err_t err = board_led_set(val->val.b);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "board LED update failed: %s", esp_err_to_name(err));
+        s_matter_light_on = val->val.b;
+        if (s_matter_started) {
+            esp_err_t err = board_led_show_matter_state();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "board LED update failed: %s", esp_err_to_name(err));
+            }
         }
     }
 
@@ -233,12 +285,18 @@ esp_err_t probe_matter_start(void)
     s_endpoint_id = endpoint::get_id(endpoint);
 
     configure_thread_platform();
+    probe_thread_set_attach_callback(thread_attach_led_cb, nullptr);
     ESP_RETURN_ON_ERROR(prepare_thread_identity_before_matter_start(), TAG, "Thread identity init failed");
 
     esp_err_t err = esp_matter::start(matter_event_cb);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "failed to start Matter: %s", esp_err_to_name(err));
         return err;
+    }
+    s_matter_started = true;
+    err = board_led_show_matter_state();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "board LED update failed after Matter start: %s", esp_err_to_name(err));
     }
 
     ESP_LOGI(TAG, "Matter placeholder On/Off endpoint id=%u", s_endpoint_id);
