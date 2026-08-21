@@ -17,6 +17,7 @@
 #include "openthread/instance.h"
 #include "openthread/ip6.h"
 #include "openthread/link.h"
+#include "openthread/mesh_diag.h"
 #include "openthread/netdiag.h"
 #include "openthread/thread.h"
 #include "openthread/thread_ftd.h"
@@ -24,29 +25,56 @@
 static const char *TAG = "probe_thread";
 
 #define PROBE_MAX_ROUTER_DIAG_ENTRIES 64
-#define PROBE_MAX_ROUTER_LINKS 64
-#define PROBE_MAX_ROUTER_CHILDREN 64
-#define PROBE_INVALID_ROUTER_ID (OT_NETWORK_MAX_ROUTER_ID + 1)
+#define PROBE_MAX_ROUTER_LINKS 16
+#define PROBE_MAX_ROUTER_CHILDREN 16
 
 typedef struct {
     uint8_t router_id;
-    uint8_t link_quality_in;
-    uint8_t link_quality_out;
-    uint8_t route_cost;
-    uint8_t next_hop;
-    uint8_t next_hop_cost;
+    uint16_t rloc16;
+    uint8_t link_quality;
+    bool has_ext_address;
+    otExtAddress ext_address;
+    uint16_t version;
+    uint8_t link_margin;
+    int8_t average_rssi;
+    int8_t last_rssi;
+    uint32_t connection_time;
+    uint16_t frame_error_rate;
+    uint16_t message_error_rate;
+    bool supports_error_rate;
     bool has_link;
+    bool has_link_quality;
+    bool has_detail;
 } probe_router_link_t;
 
 typedef struct {
-    uint16_t child_id;
-    uint16_t timeout;
+    uint16_t rloc16;
+    uint32_t timeout;
+    uint32_t age;
+    uint32_t connection_time;
+    uint16_t version;
+    uint16_t supervision_interval;
+    uint8_t link_margin;
+    int8_t average_rssi;
+    int8_t last_rssi;
+    uint16_t frame_error_rate;
+    uint16_t message_error_rate;
+    uint16_t queued_message_count;
+    uint16_t csl_period;
+    uint32_t csl_timeout;
+    uint8_t csl_channel;
     uint8_t link_quality;
     otLinkModeConfig mode;
-    bool ext_address_pending;
-    bool ext_address_responded;
+    bool rx_on_when_idle;
+    bool device_type_ftd;
+    bool full_net_data;
+    bool csl_synchronized;
+    bool supports_error_rate;
+    bool is_this_device;
+    bool is_border_router;
     bool has_ext_address;
-    otError ext_address_error;
+    bool has_link_quality;
+    bool has_detail;
     otExtAddress ext_address;
 } probe_router_child_t;
 
@@ -62,13 +90,25 @@ typedef struct {
     uint8_t link_quality_3;
     uint8_t leader_cost;
     uint8_t active_routers;
+    uint16_t version;
     uint8_t child_count;
     uint8_t stored_child_count;
     uint8_t link_count;
     bool valid;
     bool pending;
     bool responded;
-    bool child_mac_refresh_needed;
+    bool topology_responded;
+    bool detail_responded;
+    bool is_this_device;
+    bool is_this_device_parent;
+    bool is_leader;
+    bool is_border_router;
+    bool child_table_pending;
+    bool child_table_done;
+    bool router_neighbor_pending;
+    bool router_neighbor_done;
+    otError child_table_error;
+    otError router_neighbor_error;
     otError error;
     probe_router_link_t links[PROBE_MAX_ROUTER_LINKS];
     probe_router_child_t children[PROBE_MAX_ROUTER_CHILDREN];
@@ -79,6 +119,12 @@ typedef struct {
     uint16_t rloc16;
 } probe_router_diag_context_t;
 
+typedef enum {
+    PROBE_MESH_DIAG_QUERY_NONE = 0,
+    PROBE_MESH_DIAG_QUERY_CHILD_TABLE,
+    PROBE_MESH_DIAG_QUERY_ROUTER_NEIGHBOR_TABLE,
+} probe_mesh_diag_query_type_t;
+
 static portMUX_TYPE s_router_diag_lock = portMUX_INITIALIZER_UNLOCKED;
 static probe_router_diag_entry_t s_router_diag_entries[PROBE_MAX_ROUTER_DIAG_ENTRIES];
 static probe_router_diag_context_t s_router_diag_contexts[PROBE_MAX_ROUTER_DIAG_ENTRIES];
@@ -87,6 +133,9 @@ static uint32_t s_router_diag_scan_id;
 static uint8_t s_router_diag_pending_count;
 static uint32_t s_router_diag_last_auto_scan_ms;
 static bool s_router_diag_worker_started;
+static bool s_mesh_diag_topology_pending;
+static probe_mesh_diag_query_type_t s_mesh_diag_query_type;
+static probe_router_diag_context_t s_mesh_diag_query_context;
 
 #ifndef CONFIG_PROBE_THREAD_API_LOCK_TIMEOUT_MS
 #define CONFIG_PROBE_THREAD_API_LOCK_TIMEOUT_MS 0
@@ -111,15 +160,6 @@ static bool s_router_diag_worker_started;
 #ifndef CONFIG_PROBE_ROUTER_WORKER_LOCK_TIMEOUT_MS
 #define CONFIG_PROBE_ROUTER_WORKER_LOCK_TIMEOUT_MS 200
 #endif
-
-static const uint8_t s_router_diag_tlv_types[] = {
-    OT_NETWORK_DIAGNOSTIC_TLV_SHORT_ADDRESS,
-    OT_NETWORK_DIAGNOSTIC_TLV_EXT_ADDRESS,
-    OT_NETWORK_DIAGNOSTIC_TLV_CONNECTIVITY,
-    OT_NETWORK_DIAGNOSTIC_TLV_CHILD_TABLE,
-    OT_NETWORK_DIAGNOSTIC_TLV_ROUTE,
-    OT_NETWORK_DIAGNOSTIC_TLV_ENHANCED_ROUTE,
-};
 
 static bool try_acquire_thread_lock(void)
 {
@@ -194,6 +234,11 @@ static bool role_is_attached(otDeviceRole role)
     return role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER;
 }
 
+static bool thread_is_attached(otInstance *instance)
+{
+    return role_is_attached(otThreadGetDeviceRole(instance));
+}
+
 static void log_thread_attach_state(otInstance *instance)
 {
     const otExtAddress *ext_addr = otLinkGetExtendedAddress(instance);
@@ -207,6 +252,21 @@ static void log_thread_attach_state(otInstance *instance)
 
 static bool s_thread_state_logger_registered;
 static bool s_thread_was_attached;
+static probe_thread_attach_callback_t s_thread_attach_callback;
+static void *s_thread_attach_callback_context;
+
+void probe_thread_set_attach_callback(probe_thread_attach_callback_t callback, void *context)
+{
+    s_thread_attach_callback = callback;
+    s_thread_attach_callback_context = context;
+}
+
+static void notify_thread_attach_state(bool attached)
+{
+    if (s_thread_attach_callback) {
+        s_thread_attach_callback(attached, s_thread_attach_callback_context);
+    }
+}
 
 static void thread_state_changed_cb(otChangedFlags flags, void *context)
 {
@@ -215,11 +275,13 @@ static void thread_state_changed_cb(otChangedFlags flags, void *context)
     }
 
     otInstance *instance = (otInstance *)context;
-    otDeviceRole role = otThreadGetDeviceRole(instance);
-    bool attached = role_is_attached(role);
+    bool attached = thread_is_attached(instance);
 
     if (attached && !s_thread_was_attached) {
         log_thread_attach_state(instance);
+    }
+    if (attached != s_thread_was_attached) {
+        notify_thread_attach_state(attached);
     }
     s_thread_was_attached = attached;
 }
@@ -238,11 +300,11 @@ esp_err_t probe_thread_register_state_logger(otInstance *instance)
                         "register Thread state logger failed");
     s_thread_state_logger_registered = true;
 
-    otDeviceRole role = otThreadGetDeviceRole(instance);
-    s_thread_was_attached = role_is_attached(role);
+    s_thread_was_attached = thread_is_attached(instance);
     if (s_thread_was_attached) {
         log_thread_attach_state(instance);
     }
+    notify_thread_attach_state(s_thread_was_attached);
 
     return ESP_OK;
 }
@@ -281,24 +343,47 @@ static void add_ext_address(cJSON *obj, const char *name, const otExtAddress *ad
     cJSON_AddStringToObject(obj, name, value);
 }
 
+static bool ext_address_is_zero(const otExtAddress *addr)
+{
+    for (size_t i = 0; i < sizeof(addr->m8); ++i) {
+        if (addr->m8[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void set_ext_address_if_valid(bool *has_ext_address, otExtAddress *dest, const otExtAddress *src)
+{
+    if (!ext_address_is_zero(src)) {
+        *has_ext_address = true;
+        *dest = *src;
+    }
+}
+
+static void add_number_or_null(cJSON *obj, const char *name, bool valid, double value)
+{
+    if (valid) {
+        cJSON_AddNumberToObject(obj, name, value);
+    }
+}
+
+static void add_bool_or_null(cJSON *obj, const char *name, bool valid, bool value)
+{
+    if (valid) {
+        cJSON_AddBoolToObject(obj, name, value);
+    }
+}
+
+static void add_error_rate_json(cJSON *obj, const char *raw_name, const char *percent_name, bool valid, uint16_t value)
+{
+    (void)percent_name;
+    add_number_or_null(obj, raw_name, valid, value);
+}
+
 static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
-}
-
-static void router_rloc_ip6(otInstance *instance, uint16_t rloc16, otIp6Address *addr)
-{
-    memset(addr, 0, sizeof(*addr));
-    const otMeshLocalPrefix *prefix = otThreadGetMeshLocalPrefix(instance);
-    memcpy(&addr->mFields.m8[0], prefix->m8, OT_IP6_PREFIX_SIZE);
-    addr->mFields.m8[8] = 0x00;
-    addr->mFields.m8[9] = 0x00;
-    addr->mFields.m8[10] = 0x00;
-    addr->mFields.m8[11] = 0xff;
-    addr->mFields.m8[12] = 0xfe;
-    addr->mFields.m8[13] = 0x00;
-    addr->mFields.m8[14] = (uint8_t)(rloc16 >> 8);
-    addr->mFields.m8[15] = (uint8_t)rloc16;
 }
 
 static probe_router_diag_entry_t *diag_entry_by_router_id(uint8_t router_id)
@@ -307,6 +392,11 @@ static probe_router_diag_entry_t *diag_entry_by_router_id(uint8_t router_id)
         return NULL;
     }
     return &s_router_diag_entries[router_id];
+}
+
+static bool is_router_rloc16(uint16_t rloc16)
+{
+    return (rloc16 & 0x03ff) == 0 && (rloc16 >> 10) <= OT_NETWORK_MAX_ROUTER_ID;
 }
 
 static const char *ot_error_name(otError error)
@@ -323,248 +413,51 @@ static const char *ot_error_name(otError error)
     }
 }
 
-static uint16_t child_rloc16_for_entry(const probe_router_diag_entry_t *entry, const probe_router_child_t *child)
+static const char *child_ext_address_status(const probe_router_diag_entry_t *entry,
+                                            const probe_router_child_t *child)
 {
-    return (entry->rloc16 & 0xfc00) | (child->child_id & 0x01ff);
+    if (child->has_ext_address) {
+        return "ok";
+    }
+    if (entry->child_table_pending) {
+        return "pending";
+    }
+    if (!entry->child_table_done && entry->error == OT_ERROR_NONE) {
+        return "queued";
+    }
+    if (entry->child_table_done) {
+        return entry->child_table_error == OT_ERROR_NONE ? "unavailable" : ot_error_name(entry->child_table_error);
+    }
+    return ot_error_name(entry->error);
 }
 
-static probe_router_child_t *find_child_by_rloc16(probe_router_diag_entry_t *entry, uint16_t child_rloc16)
+static const char *detail_query_status(bool pending, bool done, otError error)
+{
+    if (pending) {
+        return "pending";
+    }
+    if (!done) {
+        return "queued";
+    }
+    return ot_error_name(error);
+}
+
+static probe_router_child_t *find_or_add_router_child(probe_router_diag_entry_t *entry, uint16_t rloc16)
 {
     for (uint8_t i = 0; i < entry->stored_child_count; ++i) {
-        probe_router_child_t *child = &entry->children[i];
-        if (child_rloc16_for_entry(entry, child) == child_rloc16) {
-            return child;
-        }
-    }
-    return NULL;
-}
-
-static void find_child_owner_by_rloc16(uint16_t child_rloc16,
-                                       probe_router_diag_entry_t **owner_entry,
-                                       probe_router_child_t **owner_child)
-{
-    *owner_entry = NULL;
-    *owner_child = NULL;
-
-    for (uint8_t router_id = 0; router_id < PROBE_MAX_ROUTER_DIAG_ENTRIES; ++router_id) {
-        probe_router_diag_entry_t *entry = &s_router_diag_entries[router_id];
-        if (!entry->valid) {
-            continue;
-        }
-        probe_router_child_t *child = find_child_by_rloc16(entry, child_rloc16);
-        if (child) {
-            *owner_entry = entry;
-            *owner_child = child;
-            return;
-        }
-    }
-}
-
-static bool child_mode_equal(const otLinkModeConfig *a, const otLinkModeConfig *b)
-{
-    return a->mRxOnWhenIdle == b->mRxOnWhenIdle &&
-           a->mDeviceType == b->mDeviceType &&
-           a->mNetworkData == b->mNetworkData;
-}
-
-static bool child_row_equal(const probe_router_child_t *a, const probe_router_child_t *b)
-{
-    return a->child_id == b->child_id &&
-           a->timeout == b->timeout &&
-           a->link_quality == b->link_quality &&
-           child_mode_equal(&a->mode, &b->mode);
-}
-
-static probe_router_child_t *find_child_by_id(probe_router_diag_entry_t *entry, uint16_t child_id)
-{
-    for (uint8_t i = 0; i < entry->stored_child_count; ++i) {
-        if (entry->children[i].child_id == child_id) {
+        if (entry->children[i].rloc16 == rloc16) {
             return &entry->children[i];
         }
     }
-    return NULL;
-}
 
-static bool child_table_changed(const probe_router_diag_entry_t *previous, const probe_router_diag_entry_t *current)
-{
-    if (previous->stored_child_count != current->stored_child_count) {
-        return true;
+    if (entry->stored_child_count >= PROBE_MAX_ROUTER_CHILDREN) {
+        return NULL;
     }
 
-    for (uint8_t i = 0; i < current->stored_child_count; ++i) {
-        const probe_router_child_t *current_child = &current->children[i];
-        probe_router_diag_entry_t prev_copy = *previous;
-        probe_router_child_t *previous_child = find_child_by_id(&prev_copy, current_child->child_id);
-        if (!previous_child || !child_row_equal(previous_child, current_child)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static void copy_child_mac_cache(const probe_router_diag_entry_t *previous, probe_router_diag_entry_t *current)
-{
-    probe_router_diag_entry_t prev_copy = *previous;
-    for (uint8_t i = 0; i < current->stored_child_count; ++i) {
-        probe_router_child_t *child = &current->children[i];
-        probe_router_child_t *cached = find_child_by_id(&prev_copy, child->child_id);
-        if (!cached || !cached->has_ext_address) {
-            continue;
-        }
-        child->has_ext_address = true;
-        child->ext_address = cached->ext_address;
-        child->ext_address_responded = true;
-        child->ext_address_error = OT_ERROR_NONE;
-    }
-}
-
-static bool child_mac_refresh_done(const probe_router_diag_entry_t *entry)
-{
-    for (uint8_t i = 0; i < entry->stored_child_count; ++i) {
-        const probe_router_child_t *child = &entry->children[i];
-        if (!child->has_ext_address && !child->ext_address_responded && child->ext_address_error == OT_ERROR_NONE) {
-            return false;
-        }
-        if (child->ext_address_pending) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static void child_diag_callback(otError error, otMessage *message, const otMessageInfo *message_info, void *context)
-{
-    (void)context;
-    uint16_t child_rloc16 = 0xfffe;
-    otExtAddress ext_address = {0};
-    bool has_ext_address = false;
-
-    if (message_info) {
-        child_rloc16 = ((uint16_t)message_info->mPeerAddr.mFields.m8[14] << 8) |
-                       (uint16_t)message_info->mPeerAddr.mFields.m8[15];
-    }
-
-    if (error == OT_ERROR_NONE && message) {
-        otNetworkDiagIterator iterator = OT_NETWORK_DIAGNOSTIC_ITERATOR_INIT;
-        otNetworkDiagTlv tlv = {0};
-
-        while (otThreadGetNextDiagnosticTlv(message, &iterator, &tlv) == OT_ERROR_NONE) {
-            if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_SHORT_ADDRESS) {
-                child_rloc16 = tlv.mData.mAddr16;
-            } else if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_EXT_ADDRESS) {
-                ext_address = tlv.mData.mExtAddress;
-                has_ext_address = true;
-            }
-        }
-    }
-
-    taskENTER_CRITICAL(&s_router_diag_lock);
-    probe_router_diag_entry_t *entry = NULL;
-    probe_router_child_t *child = NULL;
-    find_child_owner_by_rloc16(child_rloc16, &entry, &child);
-    if (child && entry) {
-        child->ext_address_pending = false;
-        child->ext_address_responded = error == OT_ERROR_NONE;
-        child->ext_address_error = error;
-        child->has_ext_address = has_ext_address;
-        if (has_ext_address) {
-            child->ext_address = ext_address;
-        }
-        if (child_mac_refresh_done(entry)) {
-            entry->child_mac_refresh_needed = false;
-        }
-    }
-    if (s_router_diag_pending_count > 0) {
-        s_router_diag_pending_count--;
-    }
-    taskEXIT_CRITICAL(&s_router_diag_lock);
-}
-
-static void request_next_child_ext_address(otInstance *instance)
-{
-    static const uint8_t child_tlv_types[] = {
-        OT_NETWORK_DIAGNOSTIC_TLV_EXT_ADDRESS,
-        OT_NETWORK_DIAGNOSTIC_TLV_SHORT_ADDRESS,
-    };
-
-    uint8_t target_router_id = 0xff;
-    uint8_t target_child_index = 0xff;
-    uint16_t target_child_rloc16 = 0xfffe;
-
-    taskENTER_CRITICAL(&s_router_diag_lock);
-    for (uint8_t i = 0; i < PROBE_MAX_ROUTER_DIAG_ENTRIES; ++i) {
-        const probe_router_diag_entry_t *entry = &s_router_diag_entries[i];
-        if (entry->scan_id != s_router_diag_scan_id) {
-            continue;
-        }
-        if (entry->pending) {
-            taskEXIT_CRITICAL(&s_router_diag_lock);
-            return;
-        }
-        for (uint8_t j = 0; j < entry->stored_child_count; ++j) {
-            if (entry->children[j].ext_address_pending) {
-                taskEXIT_CRITICAL(&s_router_diag_lock);
-                return;
-            }
-        }
-    }
-
-    for (uint8_t i = 0; i < PROBE_MAX_ROUTER_DIAG_ENTRIES && target_router_id == 0xff; ++i) {
-        probe_router_diag_entry_t *entry = &s_router_diag_entries[i];
-        if (entry->scan_id != s_router_diag_scan_id ||
-            !entry->valid ||
-            entry->pending ||
-            !entry->responded ||
-            entry->error != OT_ERROR_NONE ||
-            !entry->child_mac_refresh_needed) {
-            continue;
-        }
-        for (uint8_t j = 0; j < entry->stored_child_count; ++j) {
-            const probe_router_child_t *child = &entry->children[j];
-            if (child->has_ext_address || child->ext_address_pending || child->ext_address_responded) {
-                continue;
-            }
-            target_router_id = i;
-            target_child_index = j;
-            target_child_rloc16 = child_rloc16_for_entry(entry, child);
-            break;
-        }
-        if (child_mac_refresh_done(entry)) {
-            entry->child_mac_refresh_needed = false;
-        }
-    }
-    taskEXIT_CRITICAL(&s_router_diag_lock);
-
-    if (target_router_id == 0xff) {
-        return;
-    }
-
-    otIp6Address destination = {0};
-    router_rloc_ip6(instance, target_child_rloc16, &destination);
-    otError err = otThreadSendDiagnosticGet(instance,
-                                            &destination,
-                                            child_tlv_types,
-                                            sizeof(child_tlv_types),
-                                            child_diag_callback,
-                                            NULL);
-
-    taskENTER_CRITICAL(&s_router_diag_lock);
-    probe_router_diag_entry_t *entry = diag_entry_by_router_id(target_router_id);
-    if (entry && target_child_index < entry->stored_child_count) {
-        probe_router_child_t *child = &entry->children[target_child_index];
-        if (err == OT_ERROR_NONE) {
-            child->ext_address_pending = true;
-            child->ext_address_responded = false;
-            child->ext_address_error = OT_ERROR_NONE;
-            s_router_diag_pending_count++;
-        } else {
-            child->ext_address_pending = false;
-            child->ext_address_responded = false;
-            child->ext_address_error = err;
-        }
-    }
-    taskEXIT_CRITICAL(&s_router_diag_lock);
+    probe_router_child_t *child = &entry->children[entry->stored_child_count++];
+    memset(child, 0, sizeof(*child));
+    child->rloc16 = rloc16;
+    return child;
 }
 
 static probe_router_link_t *find_or_add_router_link(probe_router_diag_entry_t *entry, uint8_t router_id)
@@ -582,144 +475,234 @@ static probe_router_link_t *find_or_add_router_link(probe_router_diag_entry_t *e
     probe_router_link_t *link = &entry->links[entry->link_count++];
     memset(link, 0, sizeof(*link));
     link->router_id = router_id;
-    link->next_hop = PROBE_INVALID_ROUTER_ID;
+    link->rloc16 = (uint16_t)router_id << 10;
     return link;
 }
 
-static void router_diag_callback(otError error, otMessage *message, const otMessageInfo *message_info, void *context)
+static void seed_router_diag_entries_from_router_table(otInstance *instance)
 {
-    (void)message_info;
-    probe_router_diag_context_t *query = (probe_router_diag_context_t *)context;
-    probe_router_diag_entry_t *parsed = calloc(1, sizeof(*parsed));
+    uint8_t max_router_id = otThreadGetMaxRouterId(instance);
 
-    if (!parsed) {
-        taskENTER_CRITICAL(&s_router_diag_lock);
-        probe_router_diag_entry_t *entry = diag_entry_by_router_id(query ? query->router_id : 0xff);
-        if (entry) {
-            entry->pending = false;
-            entry->responded = false;
-            entry->error = OT_ERROR_NO_BUFS;
-            entry->updated_ms = now_ms();
-            entry->scan_id = s_router_diag_scan_id;
+    for (uint8_t router_id = 0; router_id <= max_router_id; ++router_id) {
+        otRouterInfo info = {0};
+        if (otThreadGetRouterInfo(instance, router_id, &info) != OT_ERROR_NONE || !info.mAllocated) {
+            continue;
         }
-        if (s_router_diag_pending_count > 0) {
-            s_router_diag_pending_count--;
+
+        taskENTER_CRITICAL(&s_router_diag_lock);
+        probe_router_diag_entry_t *entry = diag_entry_by_router_id(info.mRouterId);
+        if (entry) {
+            entry->router_id = info.mRouterId;
+            entry->rloc16 = info.mRloc16;
+            entry->version = info.mVersion;
+            entry->scan_id = s_router_diag_scan_id;
+            entry->updated_ms = now_ms();
+            entry->valid = true;
+            entry->pending = true;
+            entry->responded = false;
+            entry->error = OT_ERROR_NONE;
+            set_ext_address_if_valid(&entry->has_ext_address, &entry->ext_address, &info.mExtAddress);
         }
         taskEXIT_CRITICAL(&s_router_diag_lock);
+    }
+}
+
+static void store_topology_child_info(probe_router_diag_entry_t *entry, otMeshDiagRouterInfo *router_info)
+{
+    if (!router_info || !router_info->mChildIterator) {
         return;
     }
 
-    parsed->router_id = query ? query->router_id : 0xff;
-    parsed->rloc16 = query ? query->rloc16 : 0xfffe;
-    parsed->updated_ms = now_ms();
-    parsed->responded = error == OT_ERROR_NONE;
-    parsed->error = error;
-
-    if (error == OT_ERROR_NONE && message) {
-        otNetworkDiagIterator iterator = OT_NETWORK_DIAGNOSTIC_ITERATOR_INIT;
-        otNetworkDiagTlv tlv = {0};
-
-        while (otThreadGetNextDiagnosticTlv(message, &iterator, &tlv) == OT_ERROR_NONE) {
-            if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_SHORT_ADDRESS) {
-                parsed->rloc16 = tlv.mData.mAddr16;
-                parsed->router_id = (uint8_t)(parsed->rloc16 >> 10);
-            } else if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_EXT_ADDRESS) {
-                parsed->ext_address = tlv.mData.mExtAddress;
-                parsed->has_ext_address = true;
-            } else if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_CONNECTIVITY) {
-                parsed->link_quality_1 = tlv.mData.mConnectivity.mLinkQuality1;
-                parsed->link_quality_2 = tlv.mData.mConnectivity.mLinkQuality2;
-                parsed->link_quality_3 = tlv.mData.mConnectivity.mLinkQuality3;
-                parsed->leader_cost = tlv.mData.mConnectivity.mLeaderCost;
-                parsed->active_routers = tlv.mData.mConnectivity.mActiveRouters;
-            } else if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_CHILD_TABLE) {
-                parsed->child_count = tlv.mData.mChildTable.mCount;
-                parsed->stored_child_count = 0;
-                for (uint8_t i = 0;
-                     i < tlv.mData.mChildTable.mCount && parsed->stored_child_count < PROBE_MAX_ROUTER_CHILDREN;
-                     ++i) {
-                    const otNetworkDiagChildEntry *child = &tlv.mData.mChildTable.mTable[i];
-                    probe_router_child_t *stored = &parsed->children[parsed->stored_child_count++];
-                    stored->child_id = child->mChildId;
-                    stored->timeout = child->mTimeout;
-                    stored->link_quality = child->mLinkQuality;
-                    stored->mode = child->mMode;
-                    stored->ext_address_pending = false;
-                    stored->ext_address_responded = false;
-                    stored->has_ext_address = false;
-                    stored->ext_address_error = OT_ERROR_NONE;
-                }
-            } else if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_ROUTE) {
-                for (uint8_t i = 0; i < tlv.mData.mRoute.mRouteCount; ++i) {
-                    const otNetworkDiagRouteData *route = &tlv.mData.mRoute.mRouteData[i];
-                    if (route->mRouterId == parsed->router_id ||
-                        (route->mLinkQualityIn == 0 && route->mLinkQualityOut == 0)) {
-                        continue;
-                    }
-                    probe_router_link_t *link = find_or_add_router_link(parsed, route->mRouterId);
-                    if (!link) {
-                        continue;
-                    }
-                    link->has_link = true;
-                    link->link_quality_in = route->mLinkQualityIn;
-                    link->link_quality_out = route->mLinkQualityOut;
-                    link->route_cost = route->mRouteCost;
-                }
-            } else if (tlv.mType == OT_NETWORK_DIAGNOSTIC_TLV_ENHANCED_ROUTE) {
-                for (uint8_t i = 0; i < tlv.mData.mEnhRoute.mRouteCount && parsed->link_count < PROBE_MAX_ROUTER_LINKS; ++i) {
-                    const otNetworkDiagEnhRouteData *route = &tlv.mData.mEnhRoute.mRouteData[i];
-                    if (route->mIsSelf || !route->mHasLink) {
-                        continue;
-                    }
-                    probe_router_link_t *link = find_or_add_router_link(parsed, route->mRouterId);
-                    if (!link) {
-                        continue;
-                    }
-                    link->has_link = route->mHasLink;
-                    link->link_quality_in = route->mLinkQualityIn;
-                    link->link_quality_out = route->mLinkQualityOut;
-                    link->next_hop = route->mNextHop;
-                    link->next_hop_cost = route->mNextHopCost;
-                }
-            }
+    otMeshDiagChildInfo info = {0};
+    while (otMeshDiagGetNextChildInfo(router_info->mChildIterator, &info) == OT_ERROR_NONE) {
+        probe_router_child_t *child = find_or_add_router_child(entry, info.mRloc16);
+        if (!child) {
+            continue;
         }
+        child->mode = info.mMode;
+        child->link_quality = info.mLinkQuality;
+        child->has_link_quality = true;
+        child->is_this_device = info.mIsThisDevice;
+        child->is_border_router = info.mIsBorderRouter;
+        child->rx_on_when_idle = info.mMode.mRxOnWhenIdle;
+        child->device_type_ftd = info.mMode.mDeviceType;
+        child->full_net_data = info.mMode.mNetworkData;
+    }
+}
 
+static void store_topology_router_info(otMeshDiagRouterInfo *router_info, otError error)
+{
+    if (!router_info) {
+        return;
     }
 
     taskENTER_CRITICAL(&s_router_diag_lock);
-    probe_router_diag_entry_t *entry = diag_entry_by_router_id(parsed->router_id);
-    if (!entry && query) {
-        entry = diag_entry_by_router_id(query->router_id);
-    }
+    probe_router_diag_entry_t *entry = diag_entry_by_router_id(router_info->mRouterId);
     if (entry) {
-        if (error != OT_ERROR_NONE && entry->valid) {
-            *parsed = *entry;
-            parsed->responded = false;
-            parsed->error = error;
-            parsed->pending = false;
-            parsed->updated_ms = now_ms();
-        } else {
-            bool changed = true;
-            if (entry->valid && entry->responded && entry->error == OT_ERROR_NONE) {
-                changed = child_table_changed(entry, parsed);
-                copy_child_mac_cache(entry, parsed);
+        bool had_ext_address = entry->has_ext_address;
+        otExtAddress ext_address = entry->ext_address;
+
+        memset(entry, 0, sizeof(*entry));
+        entry->router_id = router_info->mRouterId;
+        entry->rloc16 = router_info->mRloc16;
+        entry->version = router_info->mVersion;
+        entry->scan_id = s_router_diag_scan_id;
+        entry->updated_ms = now_ms();
+        entry->valid = true;
+        entry->pending = true;
+        entry->responded = error == OT_ERROR_PENDING || error == OT_ERROR_NONE;
+        entry->topology_responded = entry->responded;
+        entry->error = OT_ERROR_NONE;
+        entry->has_ext_address = had_ext_address;
+        entry->ext_address = ext_address;
+        set_ext_address_if_valid(&entry->has_ext_address, &entry->ext_address, &router_info->mExtAddress);
+        entry->is_this_device = router_info->mIsThisDevice;
+        entry->is_this_device_parent = router_info->mIsThisDeviceParent;
+        entry->is_leader = router_info->mIsLeader;
+        entry->is_border_router = router_info->mIsBorderRouter;
+
+        for (uint8_t router_id = 0; router_id <= OT_NETWORK_MAX_ROUTER_ID; ++router_id) {
+            uint8_t link_quality = router_info->mLinkQualities[router_id];
+            if (router_id == router_info->mRouterId || link_quality == 0) {
+                continue;
             }
-            parsed->valid = true;
-            parsed->pending = false;
-            parsed->child_mac_refresh_needed = changed && parsed->stored_child_count > 0;
-            if (parsed->child_mac_refresh_needed && child_mac_refresh_done(parsed)) {
-                parsed->child_mac_refresh_needed = false;
+            probe_router_link_t *link = find_or_add_router_link(entry, router_id);
+            if (!link) {
+                continue;
             }
+            link->has_link = true;
+            link->link_quality = link_quality;
+            link->has_link_quality = true;
         }
-        parsed->scan_id = s_router_diag_scan_id;
-        *entry = *parsed;
-    }
-    if (s_router_diag_pending_count > 0) {
-        s_router_diag_pending_count--;
+
+        store_topology_child_info(entry, router_info);
+        entry->child_count = entry->stored_child_count;
     }
     taskEXIT_CRITICAL(&s_router_diag_lock);
+}
 
-    free(parsed);
+static void mesh_diag_topology_callback(otError error, otMeshDiagRouterInfo *router_info, void *context)
+{
+    (void)context;
+
+    store_topology_router_info(router_info, error);
+
+    if (error != OT_ERROR_PENDING) {
+        taskENTER_CRITICAL(&s_router_diag_lock);
+        s_mesh_diag_topology_pending = false;
+        if (s_router_diag_pending_count > 0) {
+            s_router_diag_pending_count--;
+        }
+        for (uint8_t i = 0; i < PROBE_MAX_ROUTER_DIAG_ENTRIES; ++i) {
+            probe_router_diag_entry_t *entry = &s_router_diag_entries[i];
+            if (entry->scan_id == s_router_diag_scan_id && entry->valid) {
+                entry->pending = false;
+            }
+        }
+        taskEXIT_CRITICAL(&s_router_diag_lock);
+    }
+}
+
+static void mesh_diag_child_table_callback(otError error, const otMeshDiagChildEntry *child_entry, void *context)
+{
+    probe_router_diag_context_t *query = (probe_router_diag_context_t *)context;
+    taskENTER_CRITICAL(&s_router_diag_lock);
+    probe_router_diag_entry_t *entry = diag_entry_by_router_id(query ? query->router_id : 0xff);
+    if (entry) {
+        if (error == OT_ERROR_PENDING && child_entry) {
+            probe_router_child_t *child = find_or_add_router_child(entry, child_entry->mRloc16);
+            if (child) {
+                entry->responded = true;
+                entry->detail_responded = true;
+                child->has_detail = true;
+                child->rloc16 = child_entry->mRloc16;
+                child->timeout = child_entry->mTimeout;
+                child->age = child_entry->mAge;
+                child->connection_time = child_entry->mConnectionTime;
+                child->version = child_entry->mVersion;
+                child->supervision_interval = child_entry->mSupervisionInterval;
+                child->link_margin = child_entry->mLinkMargin;
+                child->average_rssi = child_entry->mAverageRssi;
+                child->last_rssi = child_entry->mLastRssi;
+                child->frame_error_rate = child_entry->mFrameErrorRate;
+                child->message_error_rate = child_entry->mMessageErrorRate;
+                child->queued_message_count = child_entry->mQueuedMessageCount;
+                child->csl_period = child_entry->mCslPeriod;
+                child->csl_timeout = child_entry->mCslTimeout;
+                child->csl_channel = child_entry->mCslChannel;
+                child->rx_on_when_idle = child_entry->mRxOnWhenIdle;
+                child->device_type_ftd = child_entry->mDeviceTypeFtd;
+                child->full_net_data = child_entry->mFullNetData;
+                child->csl_synchronized = child_entry->mCslSynchronized;
+                child->supports_error_rate = child_entry->mSupportsErrRate;
+                set_ext_address_if_valid(&child->has_ext_address, &child->ext_address, &child_entry->mExtAddress);
+                child->mode.mRxOnWhenIdle = child_entry->mRxOnWhenIdle;
+                child->mode.mDeviceType = child_entry->mDeviceTypeFtd;
+                child->mode.mNetworkData = child_entry->mFullNetData;
+            }
+        } else {
+            entry->child_table_pending = false;
+            entry->child_table_done = true;
+            entry->child_table_error = error;
+            entry->pending = false;
+            entry->updated_ms = now_ms();
+            s_mesh_diag_query_type = PROBE_MESH_DIAG_QUERY_NONE;
+            if (s_router_diag_pending_count > 0) {
+                s_router_diag_pending_count--;
+            }
+        }
+        entry->child_count = entry->stored_child_count;
+    }
+    taskEXIT_CRITICAL(&s_router_diag_lock);
+}
+
+static void mesh_diag_router_neighbor_table_callback(otError error,
+                                                     const otMeshDiagRouterNeighborEntry *neighbor_entry,
+                                                     void *context)
+{
+    probe_router_diag_context_t *query = (probe_router_diag_context_t *)context;
+    taskENTER_CRITICAL(&s_router_diag_lock);
+    probe_router_diag_entry_t *entry = diag_entry_by_router_id(query ? query->router_id : 0xff);
+    if (entry) {
+        if (error == OT_ERROR_PENDING && neighbor_entry && is_router_rloc16(neighbor_entry->mRloc16)) {
+            uint8_t neighbor_router_id = (uint8_t)(neighbor_entry->mRloc16 >> 10);
+            probe_router_link_t *link = find_or_add_router_link(entry, neighbor_router_id);
+            if (link) {
+                entry->responded = true;
+                entry->detail_responded = true;
+                link->has_link = true;
+                link->has_detail = true;
+                link->rloc16 = neighbor_entry->mRloc16;
+                set_ext_address_if_valid(&link->has_ext_address, &link->ext_address, &neighbor_entry->mExtAddress);
+                link->version = neighbor_entry->mVersion;
+                link->connection_time = neighbor_entry->mConnectionTime;
+                link->link_margin = neighbor_entry->mLinkMargin;
+                link->average_rssi = neighbor_entry->mAverageRssi;
+                link->last_rssi = neighbor_entry->mLastRssi;
+                link->supports_error_rate = neighbor_entry->mSupportsErrRate;
+                link->frame_error_rate = neighbor_entry->mFrameErrorRate;
+                link->message_error_rate = neighbor_entry->mMessageErrorRate;
+
+                probe_router_diag_entry_t *neighbor = diag_entry_by_router_id(neighbor_router_id);
+                if (neighbor) {
+                    set_ext_address_if_valid(&neighbor->has_ext_address,
+                                             &neighbor->ext_address,
+                                             &neighbor_entry->mExtAddress);
+                }
+            }
+        } else {
+            entry->router_neighbor_pending = false;
+            entry->router_neighbor_done = true;
+            entry->router_neighbor_error = error;
+            entry->pending = false;
+            entry->updated_ms = now_ms();
+            s_mesh_diag_query_type = PROBE_MESH_DIAG_QUERY_NONE;
+            if (s_router_diag_pending_count > 0) {
+                s_router_diag_pending_count--;
+            }
+        }
+    }
+    taskEXIT_CRITICAL(&s_router_diag_lock);
 }
 
 static void add_router_diag_entry_json(cJSON *routers, const probe_router_diag_entry_t *entry)
@@ -729,61 +712,106 @@ static void add_router_diag_entry_json(cJSON *routers, const probe_router_diag_e
     add_rloc16(router, "rloc16", entry->rloc16);
     cJSON_AddStringToObject(router, "status", entry->pending ? "pending" : ot_error_name(entry->error));
     cJSON_AddBoolToObject(router, "responded", entry->responded);
+    cJSON_AddBoolToObject(router, "topology_responded", entry->topology_responded);
+    cJSON_AddBoolToObject(router, "detail_responded", entry->detail_responded);
     if (entry->has_ext_address) {
         add_ext_address(router, "ext_address", &entry->ext_address);
     } else {
         cJSON_AddNullToObject(router, "ext_address");
     }
     cJSON_AddNumberToObject(router, "updated_ms", entry->updated_ms);
-    cJSON_AddNumberToObject(router, "leader_cost", entry->leader_cost);
-    cJSON_AddNumberToObject(router, "active_routers", entry->active_routers);
+    cJSON_AddNumberToObject(router, "version", entry->version);
+    cJSON_AddBoolToObject(router, "leader", entry->is_leader);
+    cJSON_AddBoolToObject(router, "border_router", entry->is_border_router);
+    cJSON_AddBoolToObject(router, "this_device", entry->is_this_device);
+    cJSON_AddBoolToObject(router, "this_device_parent", entry->is_this_device_parent);
     cJSON_AddNumberToObject(router, "child_count", entry->child_count);
-    cJSON_AddNumberToObject(router, "stored_child_count", entry->stored_child_count);
-    cJSON *lq = cJSON_AddObjectToObject(router, "link_quality_counts");
-    cJSON_AddNumberToObject(lq, "lq1", entry->link_quality_1);
-    cJSON_AddNumberToObject(lq, "lq2", entry->link_quality_2);
-    cJSON_AddNumberToObject(lq, "lq3", entry->link_quality_3);
+    cJSON_AddBoolToObject(router, "child_table_done", entry->child_table_done);
+    cJSON_AddStringToObject(router,
+                            "child_table_status",
+                            detail_query_status(entry->child_table_pending,
+                                                entry->child_table_done,
+                                                entry->child_table_error));
+    cJSON_AddBoolToObject(router, "router_neighbor_table_done", entry->router_neighbor_done);
+    cJSON_AddStringToObject(router,
+                            "router_neighbor_table_status",
+                            detail_query_status(entry->router_neighbor_pending,
+                                                entry->router_neighbor_done,
+                                                entry->router_neighbor_error));
     cJSON *links = cJSON_AddArrayToObject(router, "router_neighbors");
     for (uint8_t j = 0; j < entry->link_count; ++j) {
         const probe_router_link_t *link = &entry->links[j];
+        const probe_router_diag_entry_t *linked_router = diag_entry_by_router_id(link->router_id);
+        const otExtAddress *ext_address = NULL;
         cJSON *item = cJSON_CreateObject();
         cJSON_AddNumberToObject(item, "router_id", link->router_id);
-        add_rloc16(item, "rloc16", (uint16_t)link->router_id << 10);
-        cJSON_AddNumberToObject(item, "link_quality_in", link->link_quality_in);
-        cJSON_AddNumberToObject(item, "link_quality_out", link->link_quality_out);
-        cJSON_AddNumberToObject(item, "route_cost", link->route_cost);
-        if (link->next_hop <= OT_NETWORK_MAX_ROUTER_ID) {
-            cJSON_AddNumberToObject(item, "next_hop_router_id", link->next_hop);
-            cJSON_AddNumberToObject(item, "next_hop_cost", link->next_hop_cost);
-        } else {
-            cJSON_AddNullToObject(item, "next_hop_router_id");
-            cJSON_AddNullToObject(item, "next_hop_cost");
+        if (link->has_ext_address) {
+            ext_address = &link->ext_address;
+        } else if (linked_router && linked_router->has_ext_address) {
+            ext_address = &linked_router->ext_address;
         }
+        add_rloc16(item, "rloc16", link->rloc16 != 0 ? link->rloc16 : (uint16_t)(link->router_id << 10));
+        if (ext_address) {
+            add_ext_address(item, "ext_address", ext_address);
+        } else {
+            cJSON_AddNullToObject(item, "ext_address");
+        }
+        add_number_or_null(item, "link_quality", link->has_link_quality, link->link_quality);
+        add_number_or_null(item, "version", link->has_detail, link->version);
+        add_number_or_null(item, "link_margin", link->has_detail, link->link_margin);
+        add_number_or_null(item, "average_rssi", link->has_detail, link->average_rssi);
+        add_number_or_null(item, "last_rssi", link->has_detail, link->last_rssi);
+        add_number_or_null(item, "connection_time", link->has_detail, link->connection_time);
+        add_bool_or_null(item, "supports_error_rate", link->has_detail, link->supports_error_rate);
+        add_error_rate_json(item,
+                            "frame_error_rate",
+                            "frame_error_rate_percent",
+                            link->has_detail && link->supports_error_rate,
+                            link->frame_error_rate);
+        add_error_rate_json(item,
+                            "message_error_rate",
+                            "message_error_rate_percent",
+                            link->has_detail && link->supports_error_rate,
+                            link->message_error_rate);
         cJSON_AddItemToArray(links, item);
     }
     cJSON *children = cJSON_AddArrayToObject(router, "children");
     for (uint8_t j = 0; j < entry->stored_child_count; ++j) {
         const probe_router_child_t *child = &entry->children[j];
         cJSON *item = cJSON_CreateObject();
-        cJSON_AddNumberToObject(item, "child_id", child->child_id);
-        add_rloc16(item, "rloc16", child_rloc16_for_entry(entry, child));
-        cJSON_AddNumberToObject(item, "timeout", child->timeout);
-        cJSON_AddNumberToObject(item, "link_quality", child->link_quality);
+        cJSON_AddNumberToObject(item, "child_id", child->rloc16 & 0x01ff);
+        add_rloc16(item, "rloc16", child->rloc16);
+        add_number_or_null(item, "timeout", child->has_detail, child->timeout);
+        add_number_or_null(item, "age", child->has_detail, child->age);
+        add_number_or_null(item, "connection_time", child->has_detail, child->connection_time);
+        add_number_or_null(item, "version", child->has_detail, child->version);
+        add_number_or_null(item, "link_margin", child->has_detail, child->link_margin);
+        add_number_or_null(item, "average_rssi", child->has_detail, child->average_rssi);
+        add_number_or_null(item, "last_rssi", child->has_detail, child->last_rssi);
+        add_number_or_null(item, "queued_message_count", child->has_detail, child->queued_message_count);
+        add_number_or_null(item, "supervision_interval", child->has_detail, child->supervision_interval);
+        add_bool_or_null(item, "supports_error_rate", child->has_detail, child->supports_error_rate);
+        add_error_rate_json(item,
+                            "frame_error_rate",
+                            "frame_error_rate_percent",
+                            child->has_detail && child->supports_error_rate,
+                            child->frame_error_rate);
+        add_error_rate_json(item,
+                            "message_error_rate",
+                            "message_error_rate_percent",
+                            child->has_detail && child->supports_error_rate,
+                            child->message_error_rate);
+        add_bool_or_null(item, "csl_synchronized", child->has_detail, child->csl_synchronized);
+        add_number_or_null(item, "csl_period", child->has_detail, child->csl_period);
+        add_number_or_null(item, "csl_timeout", child->has_detail, child->csl_timeout);
+        add_number_or_null(item, "csl_channel", child->has_detail, child->csl_channel);
+        add_number_or_null(item, "link_quality", child->has_link_quality, child->link_quality);
         if (child->has_ext_address) {
             add_ext_address(item, "ext_address", &child->ext_address);
-            cJSON_AddStringToObject(item, "ext_address_status", "ok");
         } else {
             cJSON_AddNullToObject(item, "ext_address");
-            if (child->ext_address_pending) {
-                cJSON_AddStringToObject(item, "ext_address_status", "pending");
-            } else if (child->ext_address_error != OT_ERROR_NONE) {
-                cJSON_AddStringToObject(item, "ext_address_status", ot_error_name(child->ext_address_error));
-            } else if (child->ext_address_responded) {
-                cJSON_AddStringToObject(item, "ext_address_status", "no_ext_address");
-            } else {
-                cJSON_AddStringToObject(item, "ext_address_status", "not_requested");
-            }
         }
+        cJSON_AddStringToObject(item, "ext_address_status", child_ext_address_status(entry, child));
         cJSON *mode = cJSON_AddObjectToObject(item, "mode");
         cJSON_AddBoolToObject(mode, "rx_on_when_idle", child->mode.mRxOnWhenIdle);
         cJSON_AddBoolToObject(mode, "full_thread_device", child->mode.mDeviceType);
@@ -799,6 +827,8 @@ static void add_router_diag_snapshot_json(cJSON *root)
     uint32_t scan_started_ms;
     uint32_t scan_age_ms;
     uint8_t pending_router = 0;
+    uint16_t active_detail_query = 0;
+    uint16_t remaining_detail_query = 0;
     uint16_t pending_child_mac = 0;
 
     taskENTER_CRITICAL(&s_router_diag_lock);
@@ -828,9 +858,20 @@ static void add_router_diag_snapshot_json(cJSON *root)
         if (entry.pending) {
             pending_router++;
         }
-        for (uint8_t j = 0; j < entry.stored_child_count; ++j) {
-            if (entry.children[j].ext_address_pending) {
-                pending_child_mac++;
+        if (entry.child_table_pending || entry.router_neighbor_pending) {
+            active_detail_query++;
+        }
+        if (!entry.child_table_done) {
+            remaining_detail_query++;
+        }
+        if (!entry.router_neighbor_done) {
+            remaining_detail_query++;
+        }
+        if (!entry.child_table_done || entry.child_table_pending) {
+            for (uint8_t j = 0; j < entry.stored_child_count; ++j) {
+                if (!entry.children[j].has_ext_address) {
+                    pending_child_mac++;
+                }
             }
         }
         add_router_diag_entry_json(routers, &entry);
@@ -838,8 +879,10 @@ static void add_router_diag_snapshot_json(cJSON *root)
 
     cJSON_AddNumberToObject(root, "pending", pending_router);
     cJSON_AddNumberToObject(root, "pending_router", pending_router);
+    cJSON_AddNumberToObject(root, "active_detail_query", active_detail_query);
+    cJSON_AddNumberToObject(root, "pending_detail_query", remaining_detail_query);
     cJSON_AddNumberToObject(root, "pending_child_mac", pending_child_mac);
-    cJSON_AddNumberToObject(root, "pending_total", (uint32_t)pending_router + pending_child_mac);
+    cJSON_AddNumberToObject(root, "pending_total", (uint32_t)pending_router + remaining_detail_query);
 }
 
 static bool router_diag_scan_in_progress(uint32_t current_ms, bool *scan_stale)
@@ -850,12 +893,7 @@ static bool router_diag_scan_in_progress(uint32_t current_ms, bool *scan_stale)
 
     taskENTER_CRITICAL(&s_router_diag_lock);
     scan_started_ms = s_router_diag_scan_started_ms;
-    for (uint8_t i = 0; i < PROBE_MAX_ROUTER_DIAG_ENTRIES; ++i) {
-        if (s_router_diag_entries[i].scan_id == s_router_diag_scan_id && s_router_diag_entries[i].pending) {
-            in_progress = true;
-            break;
-        }
-    }
+    in_progress = s_mesh_diag_topology_pending || s_router_diag_pending_count > 0;
     taskEXIT_CRITICAL(&s_router_diag_lock);
 
     if (in_progress && scan_started_ms > 0) {
@@ -872,14 +910,14 @@ static void log_router_diag_progress(void)
 {
     static uint32_t s_last_log_scan_id = UINT32_MAX;
     static uint8_t s_last_pending_router = 0xff;
-    static uint16_t s_last_pending_child = 0xffff;
+    static uint16_t s_last_pending_detail = 0xffff;
     static uint8_t s_last_done_router = 0xff;
     static uint8_t s_last_total_router = 0xff;
     static uint32_t s_last_log_ms = 0;
 
     uint32_t scan_id = 0;
     uint8_t pending_router = 0;
-    uint16_t pending_child_mac = 0;
+    uint16_t pending_detail_query = 0;
     uint8_t done_router = 0;
     uint8_t total_router = 0;
 
@@ -896,10 +934,8 @@ static void log_router_diag_progress(void)
         } else {
             done_router++;
         }
-        for (uint8_t j = 0; j < entry->stored_child_count; ++j) {
-            if (entry->children[j].ext_address_pending) {
-                pending_child_mac++;
-            }
+        if (entry->child_table_pending || entry->router_neighbor_pending) {
+            pending_detail_query++;
         }
     }
     taskEXIT_CRITICAL(&s_router_diag_lock);
@@ -907,21 +943,21 @@ static void log_router_diag_progress(void)
     const uint32_t now = now_ms();
     const bool changed = scan_id != s_last_log_scan_id ||
                          pending_router != s_last_pending_router ||
-                         pending_child_mac != s_last_pending_child ||
+                         pending_detail_query != s_last_pending_detail ||
                          done_router != s_last_done_router ||
                          total_router != s_last_total_router;
 
     if (changed || (now - s_last_log_ms) >= CONFIG_PROBE_ROUTER_PROGRESS_LOG_INTERVAL_MS) {
         ESP_LOGI(TAG,
-                 "router scan progress scan_id=%lu routers=%u/%u pending_router=%u pending_child_mac=%u",
+                 "router scan progress scan_id=%lu routers=%u/%u pending_router=%u pending_detail_query=%u",
                  (unsigned long)scan_id,
                  done_router,
                  total_router,
                  pending_router,
-                 (unsigned)pending_child_mac);
+                 (unsigned)pending_detail_query);
         s_last_log_scan_id = scan_id;
         s_last_pending_router = pending_router;
-        s_last_pending_child = pending_child_mac;
+        s_last_pending_detail = pending_detail_query;
         s_last_done_router = done_router;
         s_last_total_router = total_router;
         s_last_log_ms = now;
@@ -943,69 +979,116 @@ static bool start_router_diag_scan_with_lock(otInstance *instance, bool *scan_re
     if (scan_in_progress && !scan_stale) {
         return false;
     }
+    if (!thread_is_attached(instance)) {
+        return false;
+    }
 
-    uint8_t sent_local = 0;
     taskENTER_CRITICAL(&s_router_diag_lock);
+    memset(s_router_diag_entries, 0, sizeof(s_router_diag_entries));
     memset(s_router_diag_contexts, 0, sizeof(s_router_diag_contexts));
     s_router_diag_scan_id++;
     s_router_diag_scan_started_ms = now_ms();
-    s_router_diag_pending_count = 0;
+    s_router_diag_pending_count = 1;
+    s_mesh_diag_topology_pending = true;
+    s_mesh_diag_query_type = PROBE_MESH_DIAG_QUERY_NONE;
     taskEXIT_CRITICAL(&s_router_diag_lock);
 
-    uint8_t max_router_id = otThreadGetMaxRouterId(instance);
-    for (uint8_t router_id = 0; router_id <= max_router_id && router_id < PROBE_MAX_ROUTER_DIAG_ENTRIES; ++router_id) {
-        otRouterInfo info = {0};
-        if (otThreadGetRouterInfo(instance, router_id, &info) != OT_ERROR_NONE || !info.mAllocated) {
-            continue;
-        }
+    seed_router_diag_entries_from_router_table(instance);
 
-        otIp6Address destination = {0};
-        router_rloc_ip6(instance, info.mRloc16, &destination);
-        s_router_diag_contexts[router_id].router_id = router_id;
-        s_router_diag_contexts[router_id].rloc16 = info.mRloc16;
-
+    otMeshDiagDiscoverConfig config = {
+        .mDiscoverIp6Addresses = false,
+        .mDiscoverChildTable = true,
+    };
+    otError err = otMeshDiagDiscoverTopology(instance, &config, mesh_diag_topology_callback, NULL);
+    if (err != OT_ERROR_NONE) {
         taskENTER_CRITICAL(&s_router_diag_lock);
-        probe_router_diag_entry_t *entry = diag_entry_by_router_id(router_id);
-        if (entry) {
-            entry->valid = true;
-            entry->pending = true;
-            entry->responded = false;
-            entry->error = OT_ERROR_NONE;
-            entry->router_id = router_id;
-            entry->rloc16 = info.mRloc16;
-            entry->updated_ms = now_ms();
-            entry->scan_id = s_router_diag_scan_id;
-            s_router_diag_pending_count++;
-        }
+        s_mesh_diag_topology_pending = false;
+        s_router_diag_pending_count = 0;
         taskEXIT_CRITICAL(&s_router_diag_lock);
-
-        otError err = otThreadSendDiagnosticGet(instance,
-                                                &destination,
-                                                s_router_diag_tlv_types,
-                                                sizeof(s_router_diag_tlv_types),
-                                                router_diag_callback,
-                                                &s_router_diag_contexts[router_id]);
-        if (err == OT_ERROR_NONE) {
-            sent_local++;
-        } else {
-            taskENTER_CRITICAL(&s_router_diag_lock);
-            entry = diag_entry_by_router_id(router_id);
-            if (entry) {
-                entry->pending = false;
-                entry->responded = false;
-                entry->error = err;
-            }
-            if (s_router_diag_pending_count > 0) {
-                s_router_diag_pending_count--;
-            }
-            taskEXIT_CRITICAL(&s_router_diag_lock);
-        }
+        return false;
     }
 
     if (sent) {
-        *sent = sent_local;
+        *sent = 1;
     }
     return true;
+}
+
+static void request_next_mesh_diag_detail(otInstance *instance)
+{
+    probe_router_diag_context_t query = {0};
+    probe_mesh_diag_query_type_t query_type = PROBE_MESH_DIAG_QUERY_NONE;
+
+    taskENTER_CRITICAL(&s_router_diag_lock);
+    if (s_mesh_diag_topology_pending || s_mesh_diag_query_type != PROBE_MESH_DIAG_QUERY_NONE) {
+        taskEXIT_CRITICAL(&s_router_diag_lock);
+        return;
+    }
+
+    for (uint8_t i = 0; i < PROBE_MAX_ROUTER_DIAG_ENTRIES; ++i) {
+        probe_router_diag_entry_t *entry = &s_router_diag_entries[i];
+        if (entry->scan_id != s_router_diag_scan_id || !entry->valid || entry->error != OT_ERROR_NONE) {
+            continue;
+        }
+        if (!entry->child_table_done && !entry->child_table_pending) {
+            entry->pending = true;
+            entry->child_table_pending = true;
+            query_type = PROBE_MESH_DIAG_QUERY_CHILD_TABLE;
+        } else if (!entry->router_neighbor_done && !entry->router_neighbor_pending) {
+            entry->pending = true;
+            entry->router_neighbor_pending = true;
+            query_type = PROBE_MESH_DIAG_QUERY_ROUTER_NEIGHBOR_TABLE;
+        }
+
+        if (query_type != PROBE_MESH_DIAG_QUERY_NONE) {
+            query.router_id = entry->router_id;
+            query.rloc16 = entry->rloc16;
+            s_mesh_diag_query_type = query_type;
+            s_mesh_diag_query_context = query;
+            s_router_diag_pending_count++;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_router_diag_lock);
+
+    if (query_type == PROBE_MESH_DIAG_QUERY_NONE) {
+        return;
+    }
+
+    otError err = OT_ERROR_NONE;
+    if (query_type == PROBE_MESH_DIAG_QUERY_CHILD_TABLE) {
+        err = otMeshDiagQueryChildTable(instance, query.rloc16, mesh_diag_child_table_callback, &s_mesh_diag_query_context);
+    } else {
+        err = otMeshDiagQueryRouterNeighborTable(instance,
+                                                 query.rloc16,
+                                                 mesh_diag_router_neighbor_table_callback,
+                                                 &s_mesh_diag_query_context);
+    }
+
+    if (err == OT_ERROR_NONE) {
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_router_diag_lock);
+    probe_router_diag_entry_t *entry = diag_entry_by_router_id(query.router_id);
+    if (entry) {
+        entry->pending = false;
+        entry->updated_ms = now_ms();
+        if (query_type == PROBE_MESH_DIAG_QUERY_CHILD_TABLE) {
+            entry->child_table_pending = false;
+            entry->child_table_done = true;
+            entry->child_table_error = err;
+        } else {
+            entry->router_neighbor_pending = false;
+            entry->router_neighbor_done = true;
+            entry->router_neighbor_error = err;
+        }
+    }
+    s_mesh_diag_query_type = PROBE_MESH_DIAG_QUERY_NONE;
+    if (s_router_diag_pending_count > 0) {
+        s_router_diag_pending_count--;
+    }
+    taskEXIT_CRITICAL(&s_router_diag_lock);
 }
 
 static void add_router_json_locked(cJSON *root, otInstance *instance)
@@ -1150,21 +1233,23 @@ static void router_diag_worker_task(void *arg)
     while (true) {
         otInstance *instance = esp_openthread_get_instance();
         if (instance && esp_openthread_lock_acquire(pdMS_TO_TICKS(CONFIG_PROBE_ROUTER_WORKER_LOCK_TIMEOUT_MS))) {
-            bool scan_stale = false;
-            const uint32_t now = now_ms();
-            const bool in_progress = router_diag_scan_in_progress(now, &scan_stale);
+            if (thread_is_attached(instance)) {
+                bool scan_stale = false;
+                const uint32_t now = now_ms();
+                const bool in_progress = router_diag_scan_in_progress(now, &scan_stale);
 
-            if ((in_progress && scan_stale) ||
-                (!in_progress && (uint32_t)(now - s_router_diag_last_auto_scan_ms) >= CONFIG_PROBE_ROUTER_AUTO_SCAN_INTERVAL_MS)) {
-                bool restarted_stale = false;
-                uint8_t sent = 0;
-                if (start_router_diag_scan_with_lock(instance, &restarted_stale, &sent)) {
-                    s_router_diag_last_auto_scan_ms = now;
+                if ((in_progress && scan_stale) ||
+                    (!in_progress && (uint32_t)(now - s_router_diag_last_auto_scan_ms) >= CONFIG_PROBE_ROUTER_AUTO_SCAN_INTERVAL_MS)) {
+                    bool restarted_stale = false;
+                    uint8_t sent = 0;
+                    if (start_router_diag_scan_with_lock(instance, &restarted_stale, &sent)) {
+                        s_router_diag_last_auto_scan_ms = now;
+                    }
                 }
-            }
 
-            request_next_child_ext_address(instance);
-            log_router_diag_progress();
+                request_next_mesh_diag_detail(instance);
+                log_router_diag_progress();
+            }
             esp_openthread_lock_release();
         } else if (!instance) {
             ESP_LOGW(TAG, "router diag worker: openthread instance unavailable");
@@ -1420,6 +1505,15 @@ cJSON *probe_thread_router_neighbors_scan_json(void)
 
     if (!try_acquire_thread_lock()) {
         cJSON_AddStringToObject(root, "status", "busy");
+        return root;
+    }
+
+    if (!thread_is_attached(instance)) {
+        otDeviceRole role = otThreadGetDeviceRole(instance);
+        esp_openthread_lock_release();
+        cJSON_AddStringToObject(root, "status", "detached");
+        cJSON_AddStringToObject(root, "thread_role", role_to_string(role));
+        add_router_diag_snapshot_json(root);
         return root;
     }
 

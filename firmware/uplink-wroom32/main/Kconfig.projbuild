@@ -30,6 +30,6 @@ config UPLINK_UART_BAUD
 
 config UPLINK_PROBE_TIMEOUT_MS
     int "Probe UART timeout in ms"
-    default 2500
+    default 8000
 
 endmenu
